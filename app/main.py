@@ -2,6 +2,7 @@ import io
 import os
 import re
 import smtplib
+import time
 from email.message import EmailMessage
 from datetime import datetime, date
 from decimal import Decimal
@@ -35,6 +36,23 @@ FROM_NAME = os.getenv("FROM_NAME", "Inventory Export")
 
 app = FastAPI()
 
+WAIT_HTML = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Preparing download…</title>
+    <meta http-equiv="refresh" content="1">
+    <style>
+      body { font-family: Arial, sans-serif; padding: 24px; }
+    </style>
+  </head>
+  <body>
+    Preparing your Excel file… this page will refresh automatically.
+  </body>
+</html>
+"""
+
 
 def db_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -62,6 +80,20 @@ def get_excel_row(excel_id: str) -> Dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="excel_id not found")
     return row
+
+
+def get_excel_row_retry(excel_id: str, max_wait_s: float = 3.0, step_s: float = 0.25) -> Optional[Dict[str, Any]]:
+    deadline = time.time() + max_wait_s
+    while True:
+        row = fetch_one(
+            "SELECT excel_id, vessel_id, export_token FROM vessel_excel WHERE excel_id=%s",
+            (excel_id,),
+        )
+        if row:
+            return row
+        if time.time() >= deadline:
+            return None
+        time.sleep(step_s)
 
 
 def validate_token(excel_row: Dict[str, Any], token: str):
@@ -495,7 +527,10 @@ def health():
 
 @app.get("/download")
 def download(excel_id: str, token: str):
-    excel_row = get_excel_row(excel_id)
+    excel_row = get_excel_row_retry(excel_id, max_wait_s=3.0, step_s=0.25)
+    if not excel_row:
+        return HTMLResponse(WAIT_HTML, status_code=200)
+
     validate_token(excel_row, token)
 
     vessel_id = excel_row["vessel_id"]
@@ -506,7 +541,10 @@ def download(excel_id: str, token: str):
     content = build_workbook_bytes(excel_row, rows, vessel, cert)
     filename = build_filename(vessel, vessel_id)
 
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    }
     return StreamingResponse(
         io.BytesIO(content),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -516,7 +554,10 @@ def download(excel_id: str, token: str):
 
 @app.get("/email")
 def email(excel_id: str, token: str, to_email: str):
-    excel_row = get_excel_row(excel_id)
+    excel_row = get_excel_row_retry(excel_id, max_wait_s=3.0, step_s=0.25)
+    if not excel_row:
+        raise HTTPException(status_code=404, detail="excel_id not found")
+
     validate_token(excel_row, token)
 
     vessel_id = excel_row["vessel_id"]
