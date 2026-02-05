@@ -334,7 +334,6 @@ def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, An
     imo = vessel.get("vessel_IMO") or ""
     notes = vessel.get("vessel_notes") or ""
 
-    # purchasing email: if missing, fallback to vessel contact email
     purchasing = vessel.get("purchasing_email") or vessel.get("purchasing_mail") or vessel.get("purchasing") or ""
     if not purchasing:
         purchasing = vessel.get("vessel_contact_email") or vessel.get("email") or ""
@@ -345,7 +344,6 @@ def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, An
     cat_id = vessel.get("vessel_category_name") or vessel.get("vessel_category") or ""
     cat_name = lookup_vessel_category_name(str(cat_id)) if cat_id else ""
 
-    # booleans -> Yes/No/blank
     malaria = yesno_or_blank(vessel.get("malaria_area"))
     mfag = yesno_or_blank(vessel.get("mfag"))
     female = yesno_or_blank(vessel.get("female_onboard"))
@@ -355,7 +353,6 @@ def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, An
 
     agreement = vessel.get("vessel_subscription_type") or ""
 
-    # only numbers (no "Months")
     rr = vessel.get("resupply_rate")
     em = vessel.get("expiration_months")
 
@@ -363,13 +360,11 @@ def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, An
     cert_resupply = parse_date_any((cert or {}).get("certificate_resupply_rate"))
     cert_pack_name = (cert or {}).get("pack_name") or ""
 
-    # write to your fixed template cells
     ws["A4"].value = txt(company)
     ws["C4"].value = txt(vname)
     ws["E4"].value = malaria
     ws["G4"].value = mfag
 
-    # Certificate expiry date: 2 boxes
     ws["I4"].value = txt(cert_pack_name)
     if cert_end and cert_end < date.today():
         ws["J4"].value = "Expired"
@@ -379,10 +374,8 @@ def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, An
     else:
         ws["J4"].value = ""
 
-    # Notes big box
     ws["L4"].value = txt(notes)
 
-    # row 6
     ws["A6"].value = txt(vessel.get("vessel_contact_name") or "")
     ws["C6"].value = txt(imo)
     ws["E6"].value = female
@@ -392,19 +385,16 @@ def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, An
     else:
         ws["G6"].value = ""
 
-    # row 8
     ws["A8"].value = txt(vessel.get("vessel_contact_email") or vessel.get("email") or "")
     ws["C8"].value = txt(flag_name)
     ws["E8"].value = dang
     ws["G8"].value = txt(agreement)
 
-    # row 10
     ws["A10"].value = txt(vessel.get("vessel_contact_phone") or "")
     ws["C10"].value = txt(vessel.get("vessel_crew_size") or "")
     ws["E10"].value = narc
     ws["G10"].value = rr if rr not in (None, "") else ""
 
-    # row 12
     ws["A12"].value = txt(purchasing)
     ws["C12"].value = txt(cat_name)
     ws["E12"].value = oxygen
@@ -527,10 +517,42 @@ def health():
 
 @app.get("/download")
 def download(excel_id: str, token: str):
+    # retry om race condition na "Save" op te vangen
     excel_row = get_excel_row_retry(excel_id, max_wait_s=3.0, step_s=0.25)
+
+    # als hij er nog niet is: wait page met auto refresh (geen json error)
     if not excel_row:
         return HTMLResponse(WAIT_HTML, status_code=200)
 
+    # token check
+    validate_token(excel_row, token)
+
+    # geef een kleine HTML pagina terug die de echte download start
+    html = f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Starting download…</title>
+    <style>
+      body {{ font-family: Arial, sans-serif; padding: 24px; }}
+    </style>
+  </head>
+  <body>
+    Starting download…
+    <script>
+      window.location.href = "/download_file?excel_id={excel_id}&token={token}";
+      setTimeout(() => window.close(), 1200);
+    </script>
+  </body>
+</html>
+"""
+    return HTMLResponse(html, status_code=200)
+
+
+@app.get("/download_file")
+def download_file(excel_id: str, token: str):
+    excel_row = get_excel_row(excel_id)
     validate_token(excel_row, token)
 
     vessel_id = excel_row["vessel_id"]
