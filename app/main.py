@@ -172,7 +172,6 @@ def find_sheet_fuzzy(wb, wanted: str):
 
 
 def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
-    # Prefer enriched view; fallback vessels
     try:
         row = fetch_one(
             "SELECT to_jsonb(t) AS j FROM vw_vessels_enriched t WHERE t.vessel_id=%s",
@@ -193,7 +192,6 @@ def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
 
 
 def try_get_latest_cert(vessel_id: str) -> Dict[str, Any]:
-    # Take the latest end_date, but also ensure we get a resupply date if it exists
     try:
         row = fetch_one(
             """
@@ -257,7 +255,6 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
 
 
 def lookup_vessel_category_name(cat_id: str) -> str:
-    # Return "" if we can't find a name (better than showing an ID)
     if not cat_id:
         return ""
     candidates = [
@@ -293,7 +290,6 @@ def lookup_flag_name(flag_id: str) -> str:
                 return str(row["n"])
         except Exception:
             continue
-    # if no name found, at least show the code (AAA-0166)
     return flag_id
 
 
@@ -520,14 +516,12 @@ def download(excel_id: str, token: str):
     # retry om race condition na "Save" op te vangen
     excel_row = get_excel_row_retry(excel_id, max_wait_s=3.0, step_s=0.25)
 
-    # als hij er nog niet is: wait page met auto refresh (geen json error)
     if not excel_row:
         return HTMLResponse(WAIT_HTML, status_code=200)
 
-    # token check
     validate_token(excel_row, token)
 
-    # geef een kleine HTML pagina terug die de echte download start
+    # start download via hidden iframe (stabieler) + fallback link
     html = f"""
 <!doctype html>
 <html>
@@ -536,13 +530,27 @@ def download(excel_id: str, token: str):
     <title>Starting download…</title>
     <style>
       body {{ font-family: Arial, sans-serif; padding: 24px; }}
+      .muted {{ color: #666; font-size: 13px; }}
     </style>
   </head>
   <body>
     Starting download…
+    <div class="muted">If the download does not start, click the link below.</div>
+
+    <p>
+      <a id="dl" href="/download_file?excel_id={excel_id}&token={token}">Download manually</a>
+    </p>
+
+    <iframe id="dl_iframe" style="display:none;"></iframe>
+
     <script>
-      window.location.href = "/download_file?excel_id={excel_id}&token={token}";
-      setTimeout(() => window.close(), 1200);
+      const url = document.getElementById("dl").href;
+      document.getElementById("dl_iframe").src = url;
+
+      // try to close after a longer delay (not too fast, or download cancels)
+      setTimeout(() => {{
+        try {{ window.close(); }} catch (e) {{}}
+      }}, 8000);
     </script>
   </body>
 </html>
