@@ -1,0 +1,764 @@
+import io
+import os
+import re
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, date
+from decimal import Decimal
+from typing import List, Dict, Any, Optional, Tuple
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import errors as pg_errors
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, HTMLResponse
+
+from openpyxl import load_workbook
+
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is required")
+
+TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "app/templates/inventory_template.xlsx")
+
+INVENTORY_SHEET = os.getenv("INVENTORY_SHEET", "Inventory")
+UPLOAD_SHEET = os.getenv("UPLOAD_SHEET", "Upload")
+VESSEL_INFO_SHEET = os.getenv("VESSEL_INFO_SHEET", "Vessel Information")
+CONTROL_SHEET = os.getenv("CONTROL_SHEET", "Control")
+STORAGES_SHEET = os.getenv("STORAGES_SHEET", "Storages")
+
+MAX_FILL_ROWS = int(os.getenv("MAX_FILL_ROWS", "5000"))
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER or "no-reply@example.com")
+FROM_NAME = os.getenv("FROM_NAME", "Inventory Export")
+
+app = FastAPI()
+
+
+def db_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def fetch_one(sql: str, params: tuple) -> Optional[Dict[str, Any]]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchone()
+
+
+def fetch_all(sql: str, params: tuple) -> List[Dict[str, Any]]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+
+def get_excel_row(excel_id: str) -> Dict[str, Any]:
+    row = fetch_one(
+        "SELECT excel_id, vessel_id, export_token FROM vessel_excel WHERE excel_id=%s",
+        (excel_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="excel_id not found")
+    return row
+
+
+def validate_token(excel_row: Dict[str, Any], token: str):
+    expected = excel_row.get("export_token")
+    if not expected or token != expected:
+        raise HTTPException(status_code=403, detail="invalid token")
+
+
+def to_bool(v) -> Optional[bool]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float, Decimal)):
+        return v != 0
+    s = str(v).strip().lower()
+    if s in ("", "null", "none"):
+        return None
+    if s in ("true", "t", "yes", "y", "1", "on"):
+        return True
+    if s in ("false", "f", "no", "n", "0", "off"):
+        return False
+    return True
+
+
+def yesno_or_blank(v) -> str:
+    b = to_bool(v)
+    if b is None:
+        return ""
+    return "Yes" if b else "No"
+
+
+def parse_date_any(v) -> Optional[date]:
+    if v is None or v == "":
+        return None
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    if isinstance(v, datetime):
+        return v.date()
+    s = str(v).strip()
+    try:
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except Exception:
+        pass
+    try:
+        if len(s) >= 10 and s[2] == "-" and s[5] == "-":
+            return datetime.strptime(s[:10], "%d-%m-%Y").date()
+    except Exception:
+        pass
+    try:
+        if len(s) >= 7 and s[2] == "-":
+            d = datetime.strptime(s[:7], "%m-%Y").date()
+            return date(d.year, d.month, 1)
+    except Exception:
+        pass
+    return None
+
+
+def num_to_int(v) -> Optional[int]:
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        return 1 if v else 0
+    if isinstance(v, int):
+        return v
+    if isinstance(v, Decimal):
+        return int(v)
+    try:
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
+    try:
+        row = fetch_one(
+            "SELECT to_jsonb(t) AS j FROM vw_vessels_enriched t WHERE t.vessel_id=%s",
+            (vessel_id,),
+        )
+        if row and row.get("j"):
+            return row["j"]
+    except Exception:
+        pass
+
+    row2 = fetch_one(
+        "SELECT to_jsonb(v) AS j FROM vessels v WHERE v.vessel_id=%s",
+        (vessel_id,),
+    )
+    if row2 and row2.get("j"):
+        return row2["j"]
+    return {}
+
+
+def try_get_latest_cert(vessel_id: str) -> Dict[str, Any]:
+    try:
+        row = fetch_one(
+            """
+            SELECT to_jsonb(x) AS j
+            FROM (
+              SELECT
+                vc.certificate_end_date,
+                vc.certificate_resupply_rate,
+                vc.pack_id
+              FROM vessel_certifications vc
+              WHERE vc.vessel_id = %s
+              ORDER BY vc.certificate_end_date DESC NULLS LAST
+              LIMIT 1
+            ) x
+            """,
+            (vessel_id,),
+        )
+        return row["j"] if row and row.get("j") else {}
+    except Exception:
+        return {}
+
+
+def try_get_pack_name(pack_id: Optional[str]) -> str:
+    if not pack_id:
+        return ""
+    try:
+        row = fetch_one("SELECT pack_name FROM packs WHERE pack_id=%s", (pack_id,))
+        return (row or {}).get("pack_name", "") or ""
+    except Exception:
+        return ""
+
+
+def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
+    sql = """
+    SELECT
+      v.vessel_item_id,
+      v.vessel_id,
+      v.storage_id,
+      v.storage_display,
+      v.item_id,
+      v.pack_id,
+      v.category_id,
+      v.item_barcode,
+      v.pack_name,
+      v.vessel_item_name,
+      v.vessel_item_law_code,
+      v.vessel_item_quantity,
+      v.totalitem_qty_sql,
+      v.certificate_qty_sql,
+      v.vessel_item_expiration_date
+    FROM vw_vessel_excel_items v
+    WHERE v.excel_id = %s
+    ORDER BY
+      COALESCE(v.pack_name,'') ASC,
+      COALESCE(v.vessel_item_law_code,'') ASC,
+      COALESCE(v.storage_display,'') ASC,
+      COALESCE(v.vessel_item_name,'') ASC
+    """
+    try:
+        return fetch_all(sql, (excel_id,))
+    except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn):
+        sql2 = """
+        SELECT
+          b.vessel_item_id,
+          b.vessel_id,
+          b.storage_id,
+          b.storage_display,
+          b.item_id,
+          b.pack_id,
+          NULL::text AS category_id,
+          b.item_barcode,
+          b.pack_name,
+          b.vessel_item_name,
+          b.vessel_item_law_code,
+          b.vessel_item_quantity,
+          (SUM(b.vessel_item_quantity) OVER (PARTITION BY b.excel_id, b.item_id))::numeric AS totalitem_qty_sql,
+          b.certificate_qty_sql,
+          b.vessel_item_expiration_date
+        FROM vw_vessel_excel_items_base b
+        WHERE b.excel_id = %s
+        ORDER BY
+          COALESCE(b.pack_name,'') ASC,
+          COALESCE(b.vessel_item_law_code,'') ASC,
+          COALESCE(b.storage_display,'') ASC,
+          COALESCE(b.vessel_item_name,'') ASC
+        """
+        return fetch_all(sql2, (excel_id,))
+
+
+def get_vessel_storages(vessel_id: str, rows: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    seen = set()
+
+    try:
+        db_rows = fetch_all(
+            "SELECT storage_display, storage_id FROM vessel_storages WHERE vessel_id=%s ORDER BY storage_display",
+            (vessel_id,),
+        )
+        for r in db_rows:
+            disp = str(r.get("storage_display") or "").strip()
+            sid = str(r.get("storage_id") or "").strip()
+            if disp and disp.lower() not in seen:
+                out.append((disp, sid))
+                seen.add(disp.lower())
+    except Exception:
+        pass
+
+    for r in rows:
+        disp = str(r.get("storage_display") or "").strip()
+        sid = str(r.get("storage_id") or "").strip()
+        if disp and disp.lower() not in seen:
+            out.append((disp, sid))
+            seen.add(disp.lower())
+
+    if "inbound storage" not in seen:
+        out.insert(0, ("Inbound storage", ""))
+
+    return out
+
+
+def pick_inbound(storages: List[Tuple[str, str]]) -> Tuple[str, str]:
+    for disp, sid in storages:
+        if "inbound" in disp.strip().lower():
+            return disp, sid
+    return ("Inbound storage", storages[0][1] if storages else "")
+
+
+def build_filename_from_db(excel_row, vessel):
+    vessel_id = (excel_row or {}).get("vessel_id")
+    vessel_name = (vessel or {}).get("vessel_name") or (vessel or {}).get("name") or ""
+    imo = (vessel or {}).get("vessel_IMO") or (vessel or {}).get("vessel_imo") or (vessel or {}).get("imo") or ""
+    label = str((vessel or {}).get("vessel_label") or "").strip()
+
+    if vessel_id and (not vessel_name or not imo):
+        try:
+            row = fetch_one(
+                'SELECT vessel_name, "vessel_IMO" AS vessel_imo, vessel_label FROM vessels WHERE vessel_id=%s',
+                (vessel_id,),
+            )
+            if row:
+                vessel_name = vessel_name or (row.get("vessel_name") or "")
+                imo = imo or (row.get("vessel_imo") or "")
+                if not label:
+                    label = str(row.get("vessel_label") or "").strip()
+        except Exception:
+            pass
+
+    if (not vessel_name or not imo) and label:
+        parts = [p.strip() for p in label.split("|")]
+        if not vessel_name and len(parts) >= 1 and parts[0]:
+            vessel_name = parts[0]
+        if not imo and len(parts) >= 2 and parts[1]:
+            imo = "".join(ch for ch in parts[1] if ch.isdigit())
+
+    vessel_name = str(vessel_name or "Vessel").replace("/", "-").strip()
+    imo = str(imo or "").strip()
+    date_str = datetime.now().strftime("%d-%m-%Y")
+
+    if imo:
+        return f"Medical Inventory List - {vessel_name} - {imo} - {date_str}.xlsx"
+    return f"Medical Inventory List - {vessel_name} - {date_str}.xlsx"
+
+
+def _norm(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def header_map(ws, header_row: int = 1) -> Dict[str, int]:
+    m: Dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if isinstance(v, str) and v.strip():
+            m[_norm(v)] = c
+    return m
+
+
+def find_col(hmap: Dict[str, int], *candidates: str) -> Optional[int]:
+    for cand in candidates:
+        key = _norm(cand)
+        if key in hmap:
+            return hmap[key]
+    return None
+
+
+def clear_cols(ws, start_row: int, end_row: int, cols: List[int]):
+    for r in range(start_row, end_row + 1):
+        for c in cols:
+            ws.cell(r, c).value = None
+
+
+def set_date_cell(cell, d: Optional[date], fmt: str):
+    if d is None:
+        cell.value = None
+        return
+    cell.value = d
+    cell.number_format = fmt
+
+
+def fill_storages_sheet(wb, storages: List[Tuple[str, str]]):
+    if STORAGES_SHEET not in wb.sheetnames:
+        return
+    ws = wb[STORAGES_SHEET]
+    for r in range(2, max(ws.max_row, 250) + 1):
+        ws.cell(r, 1).value = None
+        ws.cell(r, 2).value = None
+    for i, (disp, sid) in enumerate(storages, start=2):
+        ws.cell(i, 1).value = disp
+        ws.cell(i, 2).value = sid
+
+
+def fill_inventory_sheet(wb, rows: List[Dict[str, Any]], inbound_disp: str):
+    if INVENTORY_SHEET not in wb.sheetnames:
+        raise HTTPException(status_code=500, detail=f"Sheet '{INVENTORY_SHEET}' not found in template")
+
+    ws = wb[INVENTORY_SHEET]
+    h = header_map(ws, 1)
+
+    col_storage = find_col(h, "Storage")
+    col_article = find_col(h, "Article No.", "Article No")
+    col_item = find_col(h, "Item name", "Item Name")
+    col_qty = find_col(h, "Quantity")
+    col_total = find_col(h, "Total quantity", "Total Quantity")
+    col_cert = find_col(h, "Certificate qty", "Certificate Qty")
+    col_exp = find_col(h, "Expiry date", "Expiry Date")
+    col_law = find_col(h, "Law code", "Law Code")
+    col_pack = find_col(h, "Pack name", "Pack Name")
+
+    missing = [name for name, col in [
+        ("Storage", col_storage),
+        ("Article No.", col_article),
+        ("Item name", col_item),
+        ("Quantity", col_qty),
+        ("Expiry date", col_exp),
+    ] if col is None]
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Inventory template missing columns: {', '.join(missing)}")
+
+    cols_to_fill = [c for c in [col_storage, col_article, col_item, col_qty, col_total, col_cert, col_exp, col_law, col_pack] if c is not None]
+
+    start_row = 2
+    end_row = min(MAX_FILL_ROWS, start_row + max(len(rows), 50))
+    clear_cols(ws, start_row, end_row, cols_to_fill)
+
+    for i, r in enumerate(rows):
+        row_idx = start_row + i
+        if row_idx > MAX_FILL_ROWS:
+            break
+
+        storage_disp = str(r.get("storage_display") or "").strip() or inbound_disp
+        barcode = str(r.get("item_barcode") or "").strip()
+        if not barcode:
+            barcode = "Extra"
+
+        ws.cell(row_idx, col_storage).value = storage_disp
+        ws.cell(row_idx, col_article).value = barcode
+        ws.cell(row_idx, col_item).value = str(r.get("vessel_item_name") or "")
+
+        ws.cell(row_idx, col_qty).value = num_to_int(r.get("vessel_item_quantity")) or 0
+
+        if col_total:
+            ws.cell(row_idx, col_total).value = num_to_int(r.get("totalitem_qty_sql")) or 0
+        if col_cert:
+            ws.cell(row_idx, col_cert).value = num_to_int(r.get("certificate_qty_sql")) or 0
+
+        d = parse_date_any(r.get("vessel_item_expiration_date"))
+        set_date_cell(ws.cell(row_idx, col_exp), d, "mm-yyyy")
+
+        if col_law:
+            ws.cell(row_idx, col_law).value = str(r.get("vessel_item_law_code") or "")
+        if col_pack:
+            ws.cell(row_idx, col_pack).value = str(r.get("pack_name") or "")
+
+
+def fill_upload_sheet(wb, rows: List[Dict[str, Any]], inbound_disp: str, inbound_id: str, storage_id_by_name: Dict[str, str]):
+    if UPLOAD_SHEET not in wb.sheetnames:
+        return
+    ws = wb[UPLOAD_SHEET]
+    ws.sheet_state = "hidden"
+
+    h = header_map(ws, 1)
+    start_row = 2
+    end_row = min(MAX_FILL_ROWS, start_row + max(len(rows), 50))
+    cols_to_clear = [c for c in h.values() if isinstance(c, int)]
+    clear_cols(ws, start_row, end_row, cols_to_clear)
+
+    def col(name: str) -> Optional[int]:
+        return find_col(h, name)
+
+    for i, r in enumerate(rows):
+        row_idx = start_row + i
+        if row_idx > MAX_FILL_ROWS:
+            break
+
+        storage_disp = str(r.get("storage_display") or "").strip() or inbound_disp
+        storage_id = str(r.get("storage_id") or "").strip()
+
+        if not storage_id:
+            storage_id = storage_id_by_name.get(storage_disp.lower(), "") or (inbound_id if storage_disp.lower() == inbound_disp.lower() else "")
+
+        barcode = str(r.get("item_barcode") or "").strip()
+        if not barcode:
+            barcode = "123"
+
+        mapping: Dict[str, Any] = {
+            "vessel_item_id": r.get("vessel_item_id"),
+            "vessel_id": r.get("vessel_id"),
+            "storage_id": storage_id,
+            "storage_display": storage_disp,
+            "item_id": r.get("item_id"),
+            "pack_id": r.get("pack_id"),
+            "category_id": r.get("category_id"),
+            "item_barcode": barcode,
+            "vessel_item_name": r.get("vessel_item_name"),
+            "vessel_item_quantity": num_to_int(r.get("vessel_item_quantity")) or 0,
+            "totalitem_qty_sql": num_to_int(r.get("totalitem_qty_sql")) or 0,
+            "certificate_qty_sql": num_to_int(r.get("certificate_qty_sql")) or 0,
+            "vessel_item_law_code": r.get("vessel_item_law_code"),
+            "pack_name": r.get("pack_name"),
+        }
+
+        for k, v in mapping.items():
+            cidx = col(k)
+            if cidx:
+                ws.cell(row_idx, cidx).value = v
+
+        cexp = col("vessel_item_expiration_date")
+        if cexp:
+            d = parse_date_any(r.get("vessel_item_expiration_date"))
+            set_date_cell(ws.cell(row_idx, cexp), d, "dd-mm-yyyy")
+
+
+def fill_control_sheet(wb, rows: List[Dict[str, Any]], inbound_disp: str):
+    if CONTROL_SHEET not in wb.sheetnames:
+        return
+    ws = wb[CONTROL_SHEET]
+    h = header_map(ws, 1)
+
+    col_storage = find_col(h, "Storage")
+    col_item = find_col(h, "Item name", "Item Name")
+    col_qty = find_col(h, "Quantity")
+    col_exp = find_col(h, "Expiry date", "Expiry Date")
+    col_law = find_col(h, "Law code", "Law Code")
+    col_pack = find_col(h, "Pack name", "Pack Name")
+
+    if not (col_storage and col_item and col_qty and col_exp):
+        return
+
+    cols_to_fill = [c for c in [col_storage, col_item, col_qty, col_exp, col_law, col_pack] if c is not None]
+    start_row = 2
+    end_row = min(MAX_FILL_ROWS, start_row + max(len(rows), 50))
+    clear_cols(ws, start_row, end_row, cols_to_fill)
+
+    for i, r in enumerate(rows):
+        row_idx = start_row + i
+        if row_idx > MAX_FILL_ROWS:
+            break
+
+        storage_disp = str(r.get("storage_display") or "").strip() or inbound_disp
+
+        ws.cell(row_idx, col_storage).value = storage_disp
+        ws.cell(row_idx, col_item).value = str(r.get("vessel_item_name") or "")
+        ws.cell(row_idx, col_qty).value = num_to_int(r.get("vessel_item_quantity")) or 0
+
+        d = parse_date_any(r.get("vessel_item_expiration_date"))
+        set_date_cell(ws.cell(row_idx, col_exp), d, "mm-yy")
+
+        if col_law:
+            ws.cell(row_idx, col_law).value = str(r.get("vessel_item_law_code") or "")
+        if col_pack:
+            ws.cell(row_idx, col_pack).value = str(r.get("pack_name") or "")
+
+
+
+def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, Any], cert_pack_name: str, excel_row: Dict[str, Any]):
+    if VESSEL_INFO_SHEET in wb.sheetnames:
+        ws = wb[VESSEL_INFO_SHEET]
+    else:
+        ws = wb.create_sheet(VESSEL_INFO_SHEET)
+
+    # Helper: normalize label text
+    def norm(x: str) -> str:
+        x = (x or "").strip().lower()
+        x = re.sub(r"\s+", " ", x)
+        return x
+
+    # Find a label cell (case/space insensitive)
+    def find_label_cell(label_text: str):
+        target = norm(label_text)
+        max_r = min(ws.max_row, 120) if ws.max_row else 120
+        max_c = min(ws.max_column, 60) if ws.max_column else 60
+        for r in range(1, max_r + 1):
+            for c in range(1, max_c + 1):
+                v = ws.cell(r, c).value
+                if isinstance(v, str) and norm(v) == target:
+                    return (r, c)
+        return None
+
+    # Find the nearest merged "box" below the label and write into its top-left cell
+    def write_into_box_below(label_text: str, value, date_fmt: str = None):
+        pos = find_label_cell(label_text)
+        if not pos:
+            return
+        lr, lc = pos
+
+        # If empty/None -> write empty string (so it looks blank)
+        if value is None:
+            value = ""
+
+        # scan merged ranges to find a box below the label
+        best = None
+        for r in ws.merged_cells.ranges:
+            min_row, min_col, max_row, max_col = r.min_row, r.min_col, r.max_row, r.max_col
+            if min_row <= lr:
+                continue
+            # must be close below (within 6 rows) and overlap column
+            if (min_row - lr) <= 6 and (min_col <= lc <= max_col):
+                if best is None or min_row < best.min_row:
+                    best = r
+
+        if best is not None:
+            cell = ws.cell(best.min_row, best.min_col)
+            cell.value = value
+            if date_fmt and hasattr(value, "year"):
+                cell.number_format = date_fmt
+        else:
+            # fallback: just below label
+            cell = ws.cell(lr + 1, lc)
+            cell.value = value
+            if date_fmt and hasattr(value, "year"):
+                cell.number_format = date_fmt
+
+    # Values (use blanks if missing)
+    vessel_name = vessel.get("vessel_name") or ""
+    company_name = vessel.get("company_name") or ""
+    imo = vessel.get("vessel_IMO") or vessel.get("vessel_imo") or vessel.get("imo") or ""
+    flag = vessel.get("vessel_flag_name") or vessel.get("vessel_flag") or ""
+    crew = vessel.get("vessel_crew_size") or ""
+    notes = vessel.get("vessel_notes") or ""
+    purchasing = vessel.get("purchasing_email") or ""
+    category = vessel.get("vessel_category_name") or vessel.get("vessel_category") or ""
+    agreement = vessel.get("vessel_subscription_type") or ""
+
+    malaria = yesno_or_blank(vessel.get("malaria_area"))
+    mfag = yesno_or_blank(vessel.get("mfag"))
+    female = yesno_or_blank(vessel.get("female_onboard"))
+    dang = yesno_or_blank(vessel.get("dangerous_good"))
+    narc = yesno_or_blank(vessel.get("narcotics"))
+    oxy = yesno_or_blank(vessel.get("medical_oxygen"))
+
+    rr = vessel.get("resupply_rate")
+    rr_txt = f"{rr} Months" if rr not in (None, "") else ""
+    em = vessel.get("expiration_months")
+    em_txt = f"{em} Months" if em not in (None, "") else ""
+
+    cert_end = parse_date_any((cert or {}).get("certificate_end_date"))
+    cert_resupply = parse_date_any((cert or {}).get("certificate_resupply_rate"))
+
+    # Write to boxes (labels exactly like your screenshot)
+    write_into_box_below("Company name", company_name)
+    write_into_box_below("Vessel name", vessel_name)
+    write_into_box_below("Malaria medicine", malaria)
+    write_into_box_below("MFAG", mfag)
+
+    # Certificate expiry + notes (big boxes)
+    if cert_end and cert_end < date.today():
+        write_into_box_below("Certificate expiry date", "Expired")
+    else:
+        write_into_box_below("Certificate expiry date", cert_end, "dd-mm-yyyy")
+    write_into_box_below("Notes", notes)
+
+    write_into_box_below("Contact name", vessel.get("vessel_contact_name") or "")
+    write_into_box_below("Vessel IMO / MMSI", str(imo))
+    write_into_box_below("Female onboard", female)
+    write_into_box_below("Next resupply", cert_resupply, "dd-mm-yyyy")
+
+    write_into_box_below("Contact email", vessel.get("vessel_contact_email") or vessel.get("email") or "")
+    write_into_box_below("Vessel flag", str(flag))
+    # template has typo "Dangrous goods"
+    write_into_box_below("Dangrous goods", dang)
+    write_into_box_below("Dangerous goods", dang)
+    write_into_box_below("Resupply agreement", agreement)
+
+    write_into_box_below("Contact number", vessel.get("vessel_contact_phone") or "")
+    write_into_box_below("Vessel crew size", str(crew))
+    write_into_box_below("Narcotics", narc)
+    write_into_box_below("Resupply rate", rr_txt)
+
+    write_into_box_below("Contact email (purchasing)", purchasing)
+    write_into_box_below("Vessel Category", str(category))
+    write_into_box_below("Medical oxygen", oxy)
+    write_into_box_below("Replace items expiring in", em_txt)
+
+def build_workbook_bytes(excel_row: Dict[str, Any], vessel: Dict[str, Any], rows: List[Dict[str, Any]], cert: Dict[str, Any], cert_pack_name: str) -> bytes:
+    wb = load_workbook(TEMPLATE_PATH)
+
+    storages = get_vessel_storages(excel_row["vessel_id"], rows)
+    inbound_disp, inbound_id = pick_inbound(storages)
+
+    storage_id_by_name: Dict[str, str] = {}
+    for disp, sid in storages:
+        if disp:
+            storage_id_by_name[disp.strip().lower()] = (sid or "").strip()
+
+    fill_storages_sheet(wb, storages)
+    fill_inventory_sheet(wb, rows, inbound_disp)
+    fill_control_sheet(wb, rows, inbound_disp)
+    fill_upload_sheet(wb, rows, inbound_disp, inbound_id, storage_id_by_name)
+    fill_vessel_information_sheet(wb, vessel, cert or {}, cert_pack_name, excel_row)
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def send_email_with_attachment(to_email: str, subject: str, body: str, filename: str, content: bytes):
+    if not SMTP_HOST:
+        raise HTTPException(status_code=500, detail="SMTP_HOST not configured")
+
+    msg = EmailMessage()
+    msg["From"] = f"{FROM_NAME} <{FROM_EMAIL}>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    msg.add_attachment(
+        content,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+
+    if SMTP_USE_TLS:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            if SMTP_USER:
+                s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            if SMTP_USER:
+                s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/download")
+def download(excel_id: str, token: str):
+    excel_row = get_excel_row(excel_id)
+    validate_token(excel_row, token)
+
+    vessel = try_get_vessel_json(excel_row["vessel_id"])
+    rows = get_export_rows(excel_id)
+    cert = try_get_latest_cert(excel_row["vessel_id"])
+    cert_pack_name = try_get_pack_name((cert or {}).get("pack_id"))
+
+    content = build_workbook_bytes(excel_row, vessel, rows, cert, cert_pack_name)
+    filename = build_filename_from_db(excel_row, vessel)
+
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
+
+
+@app.get("/email")
+def email(excel_id: str, token: str):
+    excel_row = get_excel_row(excel_id)
+    validate_token(excel_row, token)
+
+    vessel = try_get_vessel_json(excel_row["vessel_id"])
+    rows = get_export_rows(excel_id)
+    cert = try_get_latest_cert(excel_row["vessel_id"])
+    cert_pack_name = try_get_pack_name((cert or {}).get("pack_id"))
+
+    content = build_workbook_bytes(excel_row, vessel, rows, cert, cert_pack_name)
+    filename = build_filename_from_db(excel_row, vessel)
+
+    to_email = vessel.get("vessel_contact_email") or vessel.get("email") or ""
+    if not to_email:
+        raise HTTPException(status_code=400, detail="No vessel contact email found")
+
+    subject = f"Medical Inventory List - {vessel.get('vessel_name','')}".strip()
+    body = "Please find attached the medical inventory list export."
+
+    send_email_with_attachment(to_email, subject, body, filename, content)
+    return {"ok": True, "sent_to": to_email}
+
+
+@app.get("/")
+def index():
+    return HTMLResponse("<h3>Vessel Excel Export</h3><p>Use /download?excel_id=...&token=...</p>")
