@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
 
 from openpyxl import load_workbook
 
@@ -82,7 +82,9 @@ def get_excel_row(excel_id: str) -> Dict[str, Any]:
     return row
 
 
-def get_excel_row_retry(excel_id: str, max_wait_s: float = 3.0, step_s: float = 0.25) -> Optional[Dict[str, Any]]:
+def get_excel_row_retry(
+    excel_id: str, max_wait_s: float = 6.0, step_s: float = 0.25
+) -> Optional[Dict[str, Any]]:
     deadline = time.time() + max_wait_s
     while True:
         row = fetch_one(
@@ -172,6 +174,7 @@ def find_sheet_fuzzy(wb, wanted: str):
 
 
 def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
+    # Prefer enriched view; fallback vessels
     try:
         row = fetch_one(
             "SELECT to_jsonb(t) AS j FROM vw_vessels_enriched t WHERE t.vessel_id=%s",
@@ -192,6 +195,7 @@ def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
 
 
 def try_get_latest_cert(vessel_id: str) -> Dict[str, Any]:
+    # Take the latest end_date, but also ensure we get a resupply date if it exists
     try:
         row = fetch_one(
             """
@@ -255,6 +259,7 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
 
 
 def lookup_vessel_category_name(cat_id: str) -> str:
+    # Return "" if we can't find a name (better than showing an ID)
     if not cat_id:
         return ""
     candidates = [
@@ -265,7 +270,10 @@ def lookup_vessel_category_name(cat_id: str) -> str:
     ]
     for table, namecol, idcol in candidates:
         try:
-            row = fetch_one(f"SELECT {namecol} AS n FROM {table} WHERE {idcol}=%s LIMIT 1", (cat_id,))
+            row = fetch_one(
+                f"SELECT {namecol} AS n FROM {table} WHERE {idcol}=%s LIMIT 1",
+                (cat_id,),
+            )
             if row and row.get("n"):
                 return str(row["n"])
         except Exception:
@@ -285,7 +293,10 @@ def lookup_flag_name(flag_id: str) -> str:
     ]
     for table, namecol, idcol in candidates:
         try:
-            row = fetch_one(f"SELECT {namecol} AS n FROM {table} WHERE {idcol}=%s LIMIT 1", (flag_id,))
+            row = fetch_one(
+                f"SELECT {namecol} AS n FROM {table} WHERE {idcol}=%s LIMIT 1",
+                (flag_id,),
+            )
             if row and row.get("n"):
                 return str(row["n"])
         except Exception:
@@ -299,7 +310,10 @@ def build_filename(vessel: Dict[str, Any], vessel_id: str) -> str:
 
     if vessel_id and (not raw_name or not raw_imo):
         try:
-            row = fetch_one('SELECT vessel_name, "vessel_IMO" AS imo FROM vessels WHERE vessel_id=%s', (vessel_id,)) or {}
+            row = fetch_one(
+                'SELECT vessel_name, "vessel_IMO" AS imo FROM vessels WHERE vessel_id=%s',
+                (vessel_id,),
+            ) or {}
             raw_name = raw_name or (row.get("vessel_name") or "")
             raw_imo = raw_imo or (row.get("imo") or "")
         except Exception:
@@ -314,7 +328,9 @@ def build_filename(vessel: Dict[str, Any], vessel_id: str) -> str:
     return f"Medical Inventory List - {vessel_name} - {date_str}.xlsx"
 
 
-def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, Any], excel_row: Dict[str, Any]):
+def fill_vessel_information_sheet(
+    wb, vessel: Dict[str, Any], cert: Dict[str, Any], excel_row: Dict[str, Any]
+):
     ws = find_sheet_fuzzy(wb, VESSEL_INFO_SHEET)
     if ws is None:
         ws = wb.create_sheet(VESSEL_INFO_SHEET)
@@ -330,7 +346,12 @@ def fill_vessel_information_sheet(wb, vessel: Dict[str, Any], cert: Dict[str, An
     imo = vessel.get("vessel_IMO") or ""
     notes = vessel.get("vessel_notes") or ""
 
-    purchasing = vessel.get("purchasing_email") or vessel.get("purchasing_mail") or vessel.get("purchasing") or ""
+    purchasing = (
+        vessel.get("purchasing_email")
+        or vessel.get("purchasing_mail")
+        or vessel.get("purchasing")
+        or ""
+    )
     if not purchasing:
         purchasing = vessel.get("vessel_contact_email") or vessel.get("email") or ""
 
@@ -487,7 +508,12 @@ def fill_upload_sheet(ws, rows: List[Dict[str, Any]]):
                 ws.cell(r, c).number_format = "dd-mm-yyyy"
 
 
-def build_workbook_bytes(excel_row: Dict[str, Any], rows: List[Dict[str, Any]], vessel: Dict[str, Any], cert: Dict[str, Any]) -> bytes:
+def build_workbook_bytes(
+    excel_row: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    vessel: Dict[str, Any],
+    cert: Dict[str, Any],
+) -> bytes:
     wb = load_workbook(TEMPLATE_PATH)
 
     ws_inv = find_sheet_fuzzy(wb, INVENTORY_SHEET)
@@ -513,54 +539,29 @@ def health():
 
 @app.get("/download")
 def download(excel_id: str, token: str):
-    # retry om race condition na "Save" op te vangen
-    excel_row = get_excel_row_retry(excel_id, max_wait_s=3.0, step_s=0.25)
+    # Retry on "excel_id not found" race just after AppSheet Save
+    excel_row = get_excel_row_retry(excel_id, max_wait_s=6.0, step_s=0.25)
 
+    # If still not visible in DB, show a self-refreshing wait page (no JSON error)
     if not excel_row:
         return HTMLResponse(WAIT_HTML, status_code=200)
 
     validate_token(excel_row, token)
 
-    # start download via hidden iframe (stabieler) + fallback link
-    html = f"""
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Starting download…</title>
-    <style>
-      body {{ font-family: Arial, sans-serif; padding: 24px; }}
-      .muted {{ color: #666; font-size: 13px; }}
-    </style>
-  </head>
-  <body>
-    Starting download…
-    <div class="muted">If the download does not start, click the link below.</div>
-
-    <p>
-      <a id="dl" href="/download_file?excel_id={excel_id}&token={token}">Download manually</a>
-    </p>
-
-    <iframe id="dl_iframe" style="display:none;"></iframe>
-
-    <script>
-      const url = document.getElementById("dl").href;
-      document.getElementById("dl_iframe").src = url;
-
-      // try to close after a longer delay (not too fast, or download cancels)
-      setTimeout(() => {{
-        try {{ window.close(); }} catch (e) {{}}
-      }}, 8000);
-    </script>
-  </body>
-</html>
-"""
-    return HTMLResponse(html, status_code=200)
+    # Server-side redirect to the real file endpoint (more reliable than JS/iframe)
+    return RedirectResponse(
+        url=f"/download_file?excel_id={excel_id}&token={token}",
+        status_code=302,
+    )
 
 
 @app.get("/download_file")
 def download_file(excel_id: str, token: str):
-    excel_row = get_excel_row(excel_id)
+    # Retry also here to be safe if something calls /download_file directly
+    excel_row = get_excel_row_retry(excel_id, max_wait_s=6.0, step_s=0.25)
+    if not excel_row:
+        raise HTTPException(status_code=404, detail="excel_id not found")
+
     validate_token(excel_row, token)
 
     vessel_id = excel_row["vessel_id"]
@@ -571,8 +572,9 @@ def download_file(excel_id: str, token: str):
     content = build_workbook_bytes(excel_row, rows, vessel, cert)
     filename = build_filename(vessel, vessel_id)
 
+    safe_name = filename.replace('"', "").replace("\n", " ").replace("\r", " ")
     headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Disposition": f'attachment; filename="{safe_name}"',
         "Cache-Control": "no-store",
     }
     return StreamingResponse(
@@ -584,7 +586,7 @@ def download_file(excel_id: str, token: str):
 
 @app.get("/email")
 def email(excel_id: str, token: str, to_email: str):
-    excel_row = get_excel_row_retry(excel_id, max_wait_s=3.0, step_s=0.25)
+    excel_row = get_excel_row_retry(excel_id, max_wait_s=6.0, step_s=0.25)
     if not excel_row:
         raise HTTPException(status_code=404, detail="excel_id not found")
 
