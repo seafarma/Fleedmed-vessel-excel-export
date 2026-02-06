@@ -3,10 +3,11 @@ import os
 import re
 import smtplib
 import time
+import secrets
 from email.message import EmailMessage
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -25,6 +26,8 @@ TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "app/templates/inventory_template.xls
 INVENTORY_SHEET = os.getenv("INVENTORY_SHEET", "Inventory")
 VESSEL_INFO_SHEET = os.getenv("VESSEL_INFO_SHEET", "Vessel Information")
 UPLOAD_SHEET = os.getenv("UPLOAD_SHEET", "Upload")
+
+MAX_ROWS = int(os.getenv("MAX_ROWS", "3000"))
 
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -52,6 +55,12 @@ WAIT_HTML = """
   </body>
 </html>
 """
+
+# Where to print the certificate list in Vessel Information:
+CERT_LIST_PACK_COL = "I"
+CERT_LIST_STATUS_COL = "J"
+CERT_LIST_START_ROW = 4
+CERT_LIST_MAX_ROWS = 27  # fills I4:J30
 
 
 def db_conn():
@@ -99,8 +108,9 @@ def get_excel_row_retry(
 
 
 def validate_token(excel_row: Dict[str, Any], token: str):
-    expected = excel_row.get("export_token")
-    if not expected or token != expected:
+    expected = (excel_row.get("export_token") or "").strip()
+    tok = (token or "").strip()
+    if not expected or not secrets.compare_digest(tok, expected):
         raise HTTPException(status_code=403, detail="invalid token")
 
 
@@ -116,7 +126,8 @@ def to_bool(v) -> Optional[bool]:
         return True
     if s in ("false", "f", "no", "n", "0", "off"):
         return False
-    return True
+    # safer: unknown -> blank
+    return None
 
 
 def yesno_or_blank(v) -> str:
@@ -194,40 +205,102 @@ def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
     return {}
 
 
-def try_get_latest_cert(vessel_id: str) -> Dict[str, Any]:
-    # Take the latest end_date, but also ensure we get a resupply date if it exists
+def get_vessel_storage_map(vessel_id: str) -> Dict[str, str]:
+    """
+    If storage_display is empty in the export rows, try to resolve by storage_id via vessel_storages.
+    """
+    if not vessel_id:
+        return {}
     try:
-        row = fetch_one(
+        rows = fetch_all(
             """
-            SELECT to_jsonb(x) AS j
-            FROM (
-              SELECT
-                vc.certificate_end_date,
-                (
-                  SELECT vc2.certificate_resupply_rate
-                  FROM vessel_certifications vc2
-                  WHERE vc2.vessel_id = vc.vessel_id
-                    AND vc2.certificate_resupply_rate IS NOT NULL
-                  ORDER BY vc2.certificate_end_date DESC NULLS LAST
-                  LIMIT 1
-                ) AS certificate_resupply_rate,
-                vc.pack_id,
-                p.pack_name
-              FROM vessel_certifications vc
-              LEFT JOIN packs p ON p.pack_id = vc.pack_id
-              WHERE vc.vessel_id = %s
-              ORDER BY vc.certificate_end_date DESC NULLS LAST
-              LIMIT 1
-            ) x
+            SELECT storage_id, storage_display
+            FROM vessel_storages
+            WHERE vessel_id=%s
             """,
             (vessel_id,),
         )
-        return row["j"] if row and row.get("j") else {}
+        out: Dict[str, str] = {}
+        for r in rows or []:
+            sid = (r.get("storage_id") or "").strip()
+            disp = (r.get("storage_display") or "").strip()
+            if sid and disp:
+                out[sid] = disp
+        return out
     except Exception:
         return {}
 
 
+def get_vessel_certificates_latest_by_pack(vessel_id: str) -> List[Dict[str, Any]]:
+    """
+    Returns ALL packs linked to the vessel via vessel_certifications.
+    For each pack, only the most recent certificate_end_date is returned.
+    """
+    try:
+        return fetch_all(
+            """
+            SELECT
+              vc.pack_id,
+              p.pack_name,
+              MAX(vc.certificate_end_date)::date AS last_certificate_end_date
+            FROM vessel_certifications vc
+            LEFT JOIN packs p ON p.pack_id = vc.pack_id
+            WHERE vc.vessel_id = %s
+            GROUP BY vc.pack_id, p.pack_name
+            ORDER BY COALESCE(p.pack_name,'') ASC
+            """,
+            (vessel_id,),
+        )
+    except Exception:
+        return []
+
+
+def compute_next_resupply(cert_rows: List[Dict[str, Any]]) -> Optional[date]:
+    """
+    Next resupply = earliest (end_date - 30 days) across NON-expired latest certs per pack.
+    If none are valid => blank.
+    """
+    today = date.today()
+    candidates: List[date] = []
+    for r in cert_rows or []:
+        end_d = parse_date_any(r.get("last_certificate_end_date"))
+        if end_d and end_d >= today:
+            candidates.append(end_d - timedelta(days=30))
+    return min(candidates) if candidates else None
+
+
+def parse_item_classification_to_flags(v: Any) -> Tuple[bool, bool, bool, bool, bool]:
+    """
+    Returns N, M, C, F, O booleans based on item_classification_export.
+    Supports:
+      - code strings like: "N", "N,M", "NMCFO"
+      - keywords like: narc / malar / cool/cold/fridge / fem / oxygen/oxy/o2
+    """
+    s = "" if v is None else str(v).strip()
+    if not s:
+        return (False, False, False, False, False)
+
+    s_up = s.upper()
+    compact = re.sub(r"[\s,;/+\-|]+", "", s_up)
+
+    # Only treat as codes if it's exclusively N/M/C/F/O (avoids false matches on words)
+    if compact and re.fullmatch(r"[NMCFO]{1,10}", compact):
+        flags = set(compact)
+        return ("N" in flags, "M" in flags, "C" in flags, "F" in flags, "O" in flags)
+
+    sl = s.lower()
+    n = "narc" in sl
+    m = "malar" in sl
+    c = ("cool" in sl) or ("cold" in sl) or ("fridge" in sl)
+    f = "fem" in sl
+    o = ("oxygen" in sl) or ("oxy" in sl) or ("o2" in sl) or (sl.strip() == "o")
+    return (n, m, c, f, o)
+
+
 def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
+    """
+    NOTE: requires vw_vessel_excel_items.item_classification_export to exist.
+    """
     return fetch_all(
         """
         SELECT
@@ -245,7 +318,8 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
           v.totalitem_qty_sql,
           v.certificate_qty_sql,
           v.vessel_item_expiration_date,
-          v.pack_name
+          v.pack_name,
+          v.item_classification_export
         FROM vw_vessel_excel_items v
         WHERE v.excel_id=%s
         ORDER BY
@@ -259,7 +333,6 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
 
 
 def lookup_vessel_category_name(cat_id: str) -> str:
-    # Return "" if we can't find a name (better than showing an ID)
     if not cat_id:
         return ""
     candidates = [
@@ -329,17 +402,22 @@ def build_filename(vessel: Dict[str, Any], vessel_id: str) -> str:
 
 
 def fill_vessel_information_sheet(
-    wb, vessel: Dict[str, Any], cert: Dict[str, Any], excel_row: Dict[str, Any]
+    wb, vessel: Dict[str, Any], cert_rows: List[Dict[str, Any]], excel_row: Dict[str, Any]
 ):
     ws = find_sheet_fuzzy(wb, VESSEL_INFO_SHEET)
     if ws is None:
         ws = wb.create_sheet(VESSEL_INFO_SHEET)
 
+    # Merge base vessel data in without overriding enriched values
     vessel_id = (excel_row or {}).get("vessel_id") or ""
     if vessel_id:
-        row = fetch_one("SELECT to_jsonb(v) AS j FROM vessels v WHERE v.vessel_id=%s", (vessel_id,))
+        row = fetch_one(
+            "SELECT to_jsonb(v) AS j FROM vessels v WHERE v.vessel_id=%s",
+            (vessel_id,),
+        )
         if row and row.get("j"):
-            vessel = row["j"]
+            base_vessel = row["j"]
+            vessel = {**base_vessel, **(vessel or {})}
 
     company = vessel.get("company_name") or ""
     vname = vessel.get("vessel_name") or ""
@@ -373,31 +451,22 @@ def fill_vessel_information_sheet(
     rr = vessel.get("resupply_rate")
     em = vessel.get("expiration_months")
 
-    cert_end = parse_date_any((cert or {}).get("certificate_end_date"))
-    cert_resupply = parse_date_any((cert or {}).get("certificate_resupply_rate"))
-    cert_pack_name = (cert or {}).get("pack_name") or ""
+    # Next resupply from latest certs per pack
+    next_resupply = compute_next_resupply(cert_rows)
 
+    # Standard vessel info fields
     ws["A4"].value = txt(company)
     ws["C4"].value = txt(vname)
     ws["E4"].value = malaria
     ws["G4"].value = mfag
-
-    ws["I4"].value = txt(cert_pack_name)
-    if cert_end and cert_end < date.today():
-        ws["J4"].value = "Expired"
-    elif cert_end:
-        ws["J4"].value = cert_end
-        ws["J4"].number_format = "dd-mm-yyyy"
-    else:
-        ws["J4"].value = ""
 
     ws["L4"].value = txt(notes)
 
     ws["A6"].value = txt(vessel.get("vessel_contact_name") or "")
     ws["C6"].value = txt(imo)
     ws["E6"].value = female
-    if cert_resupply:
-        ws["G6"].value = cert_resupply
+    if next_resupply:
+        ws["G6"].value = next_resupply
         ws["G6"].number_format = "dd-mm-yyyy"
     else:
         ws["G6"].value = ""
@@ -417,9 +486,32 @@ def fill_vessel_information_sheet(
     ws["E12"].value = oxygen
     ws["G12"].value = em if em not in (None, "") else ""
 
+    # Clear certificate list range (keep formatting)
+    for r in range(CERT_LIST_START_ROW, CERT_LIST_START_ROW + CERT_LIST_MAX_ROWS):
+        ws[f"{CERT_LIST_PACK_COL}{r}"].value = None
+        ws[f"{CERT_LIST_STATUS_COL}{r}"].value = None
+        ws[f"{CERT_LIST_STATUS_COL}{r}"].number_format = "General"
+
+    # Fill certificate list (pack name + date/Expired)
+    today = date.today()
+    for idx, cr in enumerate(cert_rows[:CERT_LIST_MAX_ROWS]):
+        r = CERT_LIST_START_ROW + idx
+        pack_name = cr.get("pack_name") or ""
+        end_d = parse_date_any(cr.get("last_certificate_end_date"))
+
+        ws[f"{CERT_LIST_PACK_COL}{r}"].value = txt(pack_name)
+
+        if end_d and end_d >= today:
+            ws[f"{CERT_LIST_STATUS_COL}{r}"].value = end_d
+            ws[f"{CERT_LIST_STATUS_COL}{r}"].number_format = "dd-mm-yyyy"
+        elif end_d:
+            ws[f"{CERT_LIST_STATUS_COL}{r}"].value = "Expired"
+        else:
+            ws[f"{CERT_LIST_STATUS_COL}{r}"].value = ""
+
 
 def fill_inventory_sheet(ws, rows: List[Dict[str, Any]]):
-    headers = {}
+    headers: Dict[str, int] = {}
     for c in range(1, ws.max_column + 1):
         v = ws.cell(1, c).value
         if isinstance(v, str) and v.strip():
@@ -441,32 +533,64 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]]):
     c_law = col("Law code")
     c_pack = col("Pack name")
 
-    for r in range(2, 3001):
-        for cidx in (c_storage, c_article, c_item, c_qty, c_total, c_cert, c_exp, c_law, c_pack):
-            ws.cell(r, cidx).value = None
+    # Classification columns required per your new template
+    c_n = col("N")
+    c_m = col("M")
+    c_c = col("C")
+    c_f = col("F")
+    c_o = headers.get("o")  # optional
 
-    for i, rr in enumerate(rows):
-        r = 2 + i
+    # Clear values (keep template formatting)
+    for r in range(2, MAX_ROWS + 1):
+        for cidx in (c_storage, c_article, c_item, c_qty, c_total, c_cert, c_exp, c_law, c_pack, c_n, c_m, c_c, c_f):
+            ws.cell(r, cidx).value = None
+        if c_o:
+            ws.cell(r, c_o).value = None
+
+    # Write rows (already filtered before this function)
+    out_r = 2
+    for rr in rows:
+        if out_r > MAX_ROWS:
+            break
+
         storage = (rr.get("storage_display") or "").strip() or "Inbound storage"
         barcode = (rr.get("item_barcode") or "").strip() or "Extra"
-        ws.cell(r, c_storage).value = storage
-        ws.cell(r, c_article).value = barcode
-        ws.cell(r, c_item).value = rr.get("vessel_item_name") or ""
-        ws.cell(r, c_qty).value = num(rr.get("vessel_item_quantity")) or 0
-        ws.cell(r, c_total).value = num(rr.get("totalitem_qty_sql")) or 0
-        ws.cell(r, c_cert).value = num(rr.get("certificate_qty_sql")) or 0
+
+        ws.cell(out_r, c_storage).value = storage
+        ws.cell(out_r, c_article).value = barcode
+        ws.cell(out_r, c_item).value = rr.get("vessel_item_name") or ""
+
+        q = num(rr.get("vessel_item_quantity")) or 0
+        ws.cell(out_r, c_qty).value = q
+
+        ws.cell(out_r, c_total).value = num(rr.get("totalitem_qty_sql")) or 0
+        ws.cell(out_r, c_cert).value = num(rr.get("certificate_qty_sql")) or 0
+
         d = parse_date_any(rr.get("vessel_item_expiration_date"))
         if d:
-            ws.cell(r, c_exp).value = d
-            ws.cell(r, c_exp).number_format = "mm-yyyy"
+            ws.cell(out_r, c_exp).value = d
+            ws.cell(out_r, c_exp).number_format = "mm-yyyy"
         else:
-            ws.cell(r, c_exp).value = None
-        ws.cell(r, c_law).value = rr.get("vessel_item_law_code") or ""
-        ws.cell(r, c_pack).value = rr.get("pack_name") or ""
+            ws.cell(out_r, c_exp).value = None
+
+        ws.cell(out_r, c_law).value = rr.get("vessel_item_law_code") or ""
+        ws.cell(out_r, c_pack).value = rr.get("pack_name") or ""
+
+        # Classification letters (empty = no, letter = yes)
+        n, m, c, f, o = parse_item_classification_to_flags(rr.get("item_classification_export"))
+
+        ws.cell(out_r, c_n).value = "N" if n else None
+        ws.cell(out_r, c_m).value = "M" if m else None
+        ws.cell(out_r, c_c).value = "C" if c else None
+        ws.cell(out_r, c_f).value = "F" if f else None
+        if c_o:
+            ws.cell(out_r, c_o).value = "O" if o else None
+
+        out_r += 1
 
 
 def fill_upload_sheet(ws, rows: List[Dict[str, Any]]):
-    headers = {}
+    headers: Dict[str, int] = {}
     for c in range(1, ws.max_column + 1):
         v = ws.cell(1, c).value
         if isinstance(v, str) and v.strip():
@@ -477,42 +601,48 @@ def fill_upload_sheet(ws, rows: List[Dict[str, Any]]):
         if c:
             ws.cell(r, c).value = v
 
-    for r in range(2, 3001):
+    for r in range(2, MAX_ROWS + 1):
         for c in range(1, ws.max_column + 1):
             ws.cell(r, c).value = None
 
-    for i, rr in enumerate(rows):
-        r = 2 + i
+    out_r = 2
+    for rr in rows:
+        if out_r > MAX_ROWS:
+            break
+
         storage = (rr.get("storage_display") or "").strip() or "Inbound storage"
         barcode = (rr.get("item_barcode") or "").strip() or "123"
         d = parse_date_any(rr.get("vessel_item_expiration_date"))
 
-        setv(r, "vessel_item_id", rr.get("vessel_item_id") or "")
-        setv(r, "vessel_id", rr.get("vessel_id") or "")
-        setv(r, "storage_id", rr.get("storage_id") or "")
-        setv(r, "storage_display", storage)
-        setv(r, "item_id", rr.get("item_id") or "")
-        setv(r, "pack_id", rr.get("pack_id") or "")
-        setv(r, "category_id", rr.get("category_id") or "")
-        setv(r, "item_barcode", barcode)
-        setv(r, "vessel_item_name", rr.get("vessel_item_name") or "")
-        setv(r, "vessel_item_law_code", rr.get("vessel_item_law_code") or "")
-        setv(r, "vessel_item_quantity", num(rr.get("vessel_item_quantity")) or 0)
-        setv(r, "totalitem_qty_sql", num(rr.get("totalitem_qty_sql")) or 0)
-        setv(r, "certificate_qty_sql", num(rr.get("certificate_qty_sql")) or 0)
-        setv(r, "pack_name", rr.get("pack_name") or "")
+        setv(out_r, "vessel_item_id", rr.get("vessel_item_id") or "")
+        setv(out_r, "vessel_id", rr.get("vessel_id") or "")
+        setv(out_r, "storage_id", rr.get("storage_id") or "")
+        setv(out_r, "storage_display", storage)
+        setv(out_r, "item_id", rr.get("item_id") or "")
+        setv(out_r, "pack_id", rr.get("pack_id") or "")
+        setv(out_r, "category_id", rr.get("category_id") or "")
+        setv(out_r, "item_barcode", barcode)
+        setv(out_r, "vessel_item_name", rr.get("vessel_item_name") or "")
+        setv(out_r, "vessel_item_law_code", rr.get("vessel_item_law_code") or "")
+        setv(out_r, "vessel_item_quantity", num(rr.get("vessel_item_quantity")) or 0)
+        setv(out_r, "totalitem_qty_sql", num(rr.get("totalitem_qty_sql")) or 0)
+        setv(out_r, "certificate_qty_sql", num(rr.get("certificate_qty_sql")) or 0)
+        setv(out_r, "pack_name", rr.get("pack_name") or "")
+
         if d:
-            setv(r, "vessel_item_expiration_date", d)
+            setv(out_r, "vessel_item_expiration_date", d)
             c = headers.get("vessel_item_expiration_date")
             if c:
-                ws.cell(r, c).number_format = "dd-mm-yyyy"
+                ws.cell(out_r, c).number_format = "dd-mm-yyyy"
+
+        out_r += 1
 
 
 def build_workbook_bytes(
     excel_row: Dict[str, Any],
     rows: List[Dict[str, Any]],
     vessel: Dict[str, Any],
-    cert: Dict[str, Any],
+    cert_rows: List[Dict[str, Any]],
 ) -> bytes:
     wb = load_workbook(TEMPLATE_PATH)
 
@@ -525,7 +655,7 @@ def build_workbook_bytes(
     if ws_up is not None:
         fill_upload_sheet(ws_up, rows)
 
-    fill_vessel_information_sheet(wb, vessel, cert, excel_row)
+    fill_vessel_information_sheet(wb, vessel, cert_rows, excel_row)
 
     out = io.BytesIO()
     wb.save(out)
@@ -566,10 +696,31 @@ def download_file(excel_id: str, token: str):
 
     vessel_id = excel_row["vessel_id"]
     vessel = try_get_vessel_json(vessel_id)
-    cert = try_get_latest_cert(vessel_id)
+
+    # Certificates: latest per pack (show all packs; date or Expired)
+    cert_rows = get_vessel_certificates_latest_by_pack(vessel_id)
+
     rows = get_export_rows(excel_id)
 
-    content = build_workbook_bytes(excel_row, rows, vessel, cert)
+    # Storage display fix using vessel_storages (only when missing)
+    storage_map = get_vessel_storage_map(vessel_id)
+    if storage_map:
+        for rr in rows:
+            if not (rr.get("storage_display") or "").strip():
+                sid = (rr.get("storage_id") or "").strip()
+                if sid and storage_map.get(sid):
+                    rr["storage_display"] = storage_map[sid]
+
+    # Skip items with qty 0 (applies to both Inventory + Upload)
+    filtered_rows: List[Dict[str, Any]] = []
+    for rr in rows:
+        q = num(rr.get("vessel_item_quantity"))
+        q = 0 if q is None else q
+        if q == 0:
+            continue
+        filtered_rows.append(rr)
+
+    content = build_workbook_bytes(excel_row, filtered_rows, vessel, cert_rows)
     filename = build_filename(vessel, vessel_id)
 
     safe_name = filename.replace('"', "").replace("\n", " ").replace("\r", " ")
@@ -594,10 +745,26 @@ def email(excel_id: str, token: str, to_email: str):
 
     vessel_id = excel_row["vessel_id"]
     vessel = try_get_vessel_json(vessel_id)
-    cert = try_get_latest_cert(vessel_id)
+    cert_rows = get_vessel_certificates_latest_by_pack(vessel_id)
     rows = get_export_rows(excel_id)
 
-    content = build_workbook_bytes(excel_row, rows, vessel, cert)
+    storage_map = get_vessel_storage_map(vessel_id)
+    if storage_map:
+        for rr in rows:
+            if not (rr.get("storage_display") or "").strip():
+                sid = (rr.get("storage_id") or "").strip()
+                if sid and storage_map.get(sid):
+                    rr["storage_display"] = storage_map[sid]
+
+    filtered_rows: List[Dict[str, Any]] = []
+    for rr in rows:
+        q = num(rr.get("vessel_item_quantity"))
+        q = 0 if q is None else q
+        if q == 0:
+            continue
+        filtered_rows.append(rr)
+
+    content = build_workbook_bytes(excel_row, filtered_rows, vessel, cert_rows)
     filename = build_filename(vessel, vessel_id)
 
     subject = f"Medical Inventory List - {vessel.get('vessel_name','')}".strip()
