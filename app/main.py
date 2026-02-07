@@ -201,19 +201,16 @@ def safe_set(ws, addr: str, value, number_format: Optional[str] = None):
 # ==============================
 
 def letters_from_item_type(item_type: Any) -> Set[str]:
-    """
-    Your requirement: Excel should show C if the item is a Cool Good.
-    item_type comes from AppSheet EnumList, e.g. "🔵Cool Good,🟣Female Gender"
-    """
     s = str(item_type or "").lower()
     out: Set[str] = set()
+
     if "cool good" in s:
         out.add("C")
-     if "narcotic" in s:
+    if "narcotic" in s:
         out.add("N")
-    if "dangerous" in s:
+    if "dangerous good" in s or "dangerous" in s:
         out.add("D")
-    if "female" in s:
+    if "female gender" in s or "female" in s:
         out.add("F")
     if "medical oxygen" in s or re.search(r"\boxygen\b", s):
         out.add("O")
@@ -221,6 +218,7 @@ def letters_from_item_type(item_type: Any) -> Set[str]:
         out.add("M")
 
     return out
+
 # ==============================
 # excel_id lookup + token
 # ==============================
