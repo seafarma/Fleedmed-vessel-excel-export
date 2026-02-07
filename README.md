@@ -1,80 +1,72 @@
-Fleetmed vessel excel export
+# Vessel Excel Export (FastAPI)
 
-What this service does
-- Generates an Excel file based on app/templates/inventory_template.xlsx
-- Uses data from Cloud SQL (PostgreSQL)
-- Protects downloads with a per-export token stored in the database table vessel_excel
+Service that generates an Excel “Medical Inventory List” for a vessel using a template workbook and data from PostgreSQL.
 
-Endpoints
-- GET /health
-  Returns {"ok": true}
+## Endpoints
 
-- GET /download?excel_id=...&token=...
-  User-friendly entry endpoint.
-  It waits briefly for the excel_id record to appear (race after AppSheet Save).
-  If found, it redirects to /download_file.
+- `GET /health` → `{ "ok": true }`
+- `GET /download?excel_id=...&token=...`
+  - If the row is not yet visible in DB, returns a self-refreshing HTML “Preparing…” page.
+  - Otherwise redirects (302) to `/download_file`.
+- `GET /download_file?excel_id=...&token=...` → downloads the Excel file
+- `GET /email?excel_id=...&token=...&to_email=...` → emails the Excel file as attachment
 
-- GET /download_file?excel_id=...&token=...
-  Returns the Excel file as an attachment.
+## Required environment variables
 
-- GET /email?excel_id=...&token=...&to_email=...
-  Sends the Excel file to the given email address.
-  Requires SMTP env vars to be set.
+- `DATABASE_URL` (required)  
+  Example: `postgresql://user:pass@host:5432/dbname`
 
-Authentication / token
-- The token is not an environment variable.
-- The token must match vessel_excel.export_token for the given excel_id.
-- Example query:
+## Optional environment variables
 
-  SELECT excel_id, vessel_id, export_token
-  FROM vessel_excel
-  WHERE excel_id = '976bc0bf';
+- `TEMPLATE_PATH` (default: `app/templates/inventory_template.xlsx`)
+- `INVENTORY_SHEET` (default: `Inventory`)
+- `VESSEL_INFO_SHEET` (default: `Vessel Information`)
+- `UPLOAD_SHEET` (default: `Upload`)
+- `STORAGE_SHEET` (default: `Storage`)
+- `MAX_ROWS` (default: `3000`)
 
-Download test (Cloud Shell)
-- Replace <TOKEN> with the export_token from the database:
+### SMTP (only needed for `/email`)
+- `SMTP_HOST`
+- `SMTP_PORT` (default: `587`)
+- `SMTP_USER`
+- `SMTP_PASSWORD`
+- `SMTP_USE_TLS` (default: `true`)
+- `FROM_EMAIL` (default: `SMTP_USER` or `no-reply@example.com`)
+- `FROM_NAME` (default: `Inventory Export`)
 
-  TOKEN="<TOKEN>"
-  URL="https://vessel-excel-export-799072059168.europe-west4.run.app/download?excel_id=976bc0bf&token=${TOKEN}"
-  curl -L -o ~/test.xlsx "$URL"
-  file ~/test.xlsx
+## Template expectations
 
-If file prints "Microsoft Excel 2007+" then the download is correct.
+Workbook should include at least:
 
-Environment variables
-Required
-- DATABASE_URL
-  Example (Cloud SQL unix socket):
-  postgresql://USER:PASSWORD@/DBNAME?host=/cloudsql/PROJECT:REGION:INSTANCE
+### Inventory sheet
+Headers must contain:
+- `Storage`, `Article No.`, `Item name`, `Quantity`, `Total quantity`, `Certificate qty`, `Expiry date`, `Law code`, `Pack name`
+And classification columns:
+- `N`, `M`, `C`, `D`, `F`, `O`
 
-Optional
-- TEMPLATE_PATH (default: app/templates/inventory_template.xlsx)
-- INVENTORY_SHEET (default: Inventory)
-- VESSEL_INFO_SHEET (default: Vessel Information)
-- UPLOAD_SHEET (default: Upload)
+### Vessel Information sheet (template 2.03 mapping)
+- Company: `A4`
+- Vessel name: `C4`
+- Malaria medicine: `E4`
+- MFAG: `G4`
+- Next resupply: `I4`
+- Certificates (multi-line): `K4`
+- Notes: `N4` (merged area)
+- Female onboard: `E6`
+- Cool Items: `G6`
+- Flag: `C8`
+- Vessel Category: `C12`
+- Medical oxygen: `E12`
 
-Email (only required for /email)
-- SMTP_HOST
-- SMTP_PORT (default 587)
-- SMTP_USER
-- SMTP_PASSWORD
-- SMTP_USE_TLS (default true)
-- FROM_EMAIL (default SMTP_USER or no-reply@example.com)
-- FROM_NAME (default Inventory Export)
+### Storage sheet
+Columns:
+- `A1` = `Storage Name`
+- `B1` = `storage_id`
+The service fills rows 2..N with vessel storages (sorted).
 
-Template requirements
-The template is loaded and then filled.
-Your sheet names must match:
-- Inventory
-- Vessel Information
-- Upload
+## Run locally
 
-The Inventory sheet must have the expected headers in row 1 (exact names matter because the code matches by header text).
-
-Docker / Cloud Run
-Dockerfile builds a Python 3.11 container and runs:
+```bash
+pip install -r requirements.txt
+export DATABASE_URL="postgresql://..."
 uvicorn app.main:app --host 0.0.0.0 --port 8080
-
-Local run (optional)
-- Set DATABASE_URL and make sure your template is present:
-  export DATABASE_URL="..."
-  uvicorn app.main:app --host 0.0.0.0 --port 8080
