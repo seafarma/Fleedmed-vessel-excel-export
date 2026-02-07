@@ -44,7 +44,7 @@ SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
 FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER or "no-reply@example.com")
 FROM_NAME = os.getenv("FROM_NAME", "Inventory Export")
 
-# Inventory classification columns
+# Inventory classification columns in template
 CLASS_LETTERS = ("N", "M", "C", "D", "F", "O")
 
 app = FastAPI()
@@ -180,10 +180,6 @@ def find_sheet_fuzzy(wb, wanted: str):
 
 
 def safe_set(ws, addr: str, value, number_format: Optional[str] = None):
-    """
-    Write to a cell, but if the cell is part of a merged range, write to the top-left cell.
-    Prevents: "MergedCell object attribute 'value' is read-only".
-    """
     cell = ws[addr]
     if isinstance(cell, MergedCell):
         for r in ws.merged_cells.ranges:
@@ -201,32 +197,18 @@ def safe_set(ws, addr: str, value, number_format: Optional[str] = None):
 
 
 # ==============================
-# Item-type -> N/M/C/D/F/O helper
+# Item type -> letters
 # ==============================
 
 def letters_from_item_type(item_type: Any) -> Set[str]:
     """
-    item_type comes from AppSheet EnumList, examples:
-      "🔵Cool Good,🟣Female Gender"
-      "🟠Narcotic"
-    We ignore emojis and just search for words.
+    Your requirement: Excel should show C if the item is a Cool Good.
+    item_type comes from AppSheet EnumList, e.g. "🔵Cool Good,🟣Female Gender"
     """
     s = str(item_type or "").lower()
     out: Set[str] = set()
-
     if "cool good" in s:
         out.add("C")
-    if "narcotic" in s:
-        out.add("N")
-    if "dangerous" in s:
-        out.add("D")
-    if "medical oxygen" in s or re.search(r"\boxygen\b", s):
-        out.add("O")
-    if "malaria" in s:
-        out.add("M")
-    if "female" in s:
-        out.add("F")
-
     return out
 
 
@@ -273,7 +255,7 @@ def _json_as_dict(v: Any) -> Dict[str, Any]:
 
 
 def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
-    # Prefer enriched view; fallback vessels
+    # vw_vessels_enriched already includes vessel_flag_name + vessel_category_name
     try:
         row = fetch_one(
             "SELECT to_jsonb(t) AS j FROM vw_vessels_enriched t WHERE t.vessel_id=%s",
@@ -384,9 +366,6 @@ def get_vessel_storages(vessel_id: str) -> List[Dict[str, Any]]:
 
 
 def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
-    """
-    Pull rows from vw_vessel_excel_items, including item_type (EnumList) so we can set C per row.
-    """
     sql = """
         SELECT
           v.vessel_item_id,
@@ -397,13 +376,14 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
           v.pack_id,
           v.category_id,
           v.item_barcode,
+          v.pack_name,
           v.vessel_item_name,
           v.vessel_item_law_code,
           v.vessel_item_quantity,
+          v.vessel_item_expiration_date,
+          v.item_status,
           v.totalitem_qty_sql,
           v.certificate_qty_sql,
-          v.vessel_item_expiration_date,
-          v.pack_name,
           v.item_classification_export,
           v.item_type
         FROM vw_vessel_excel_items v
@@ -414,104 +394,11 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
           COALESCE(v.storage_display,'') ASC,
           COALESCE(v.vessel_item_name,'') ASC
     """
-    try:
-        return fetch_all(sql, (excel_id,))
-    except Exception:
-        # fallback: if item_type column not present yet
-        sql2 = """
-            SELECT
-              v.vessel_item_id,
-              v.vessel_id,
-              v.storage_id,
-              v.storage_display,
-              v.item_id,
-              v.pack_id,
-              v.category_id,
-              v.item_barcode,
-              v.vessel_item_name,
-              v.vessel_item_law_code,
-              v.vessel_item_quantity,
-              v.totalitem_qty_sql,
-              v.certificate_qty_sql,
-              v.vessel_item_expiration_date,
-              v.pack_name,
-              v.item_classification_export
-            FROM vw_vessel_excel_items v
-            WHERE v.excel_id=%s
-            ORDER BY
-              COALESCE(v.pack_name,'') ASC,
-              COALESCE(v.vessel_item_law_code,'') ASC,
-              COALESCE(v.storage_display,'') ASC,
-              COALESCE(v.vessel_item_name,'') ASC
-        """
-        rows = fetch_all(sql2, (excel_id,))
-        for r in rows:
+    rows = fetch_all(sql, (excel_id,))
+    for r in rows:
+        if "item_type" not in r:
             r["item_type"] = ""
-        return rows
-
-
-# ==============================
-# Lookups (flag + category)
-# ==============================
-
-def lookup_flag_name(flag_code_or_id: str) -> str:
-    """
-    Tries to resolve AAA-xxxx to readable name. If no mapping table, keeps code.
-    """
-    v = (flag_code_or_id or "").strip()
-    if not v:
-        return ""
-
-    # If already readable, keep it
-    if not _FLAG_CODE_RE.match(v) and not looks_like_uuid(v) and not looks_like_short_id(v):
-        return v
-
-    # Best-effort lookups (schema differs; many DBs have `entity`, some have flags tables)
-    queries: List[Tuple[str, Tuple[Any, ...]]] = [
-        ("SELECT entity_name AS n FROM entity WHERE entity_code=%s LIMIT 1", (v,)),
-        ("SELECT entity_name AS n FROM entity WHERE entity_id=%s LIMIT 1", (v,)),
-        ("SELECT vessel_flag_name AS n FROM vessel_flags WHERE vessel_flag_id=%s LIMIT 1", (v,)),
-        ("SELECT flag_name AS n FROM flags WHERE flag_id=%s LIMIT 1", (v,)),
-    ]
-
-    for sql, params in queries:
-        try:
-            row = fetch_one(sql, params)
-            if row and row.get("n"):
-                return str(row["n"])
-        except Exception:
-            continue
-
-    return v
-
-
-def lookup_vessel_category_name(cat_id_or_name: str) -> str:
-    """
-    Resolve vessel category id to label if possible. If not found, return "".
-    """
-    v = (cat_id_or_name or "").strip()
-    if not v:
-        return ""
-
-    if not looks_like_uuid(v) and not looks_like_short_id(v):
-        return v
-
-    queries: List[Tuple[str, Tuple[Any, ...]]] = [
-        ("SELECT entity_name AS n FROM entity WHERE entity_id=%s LIMIT 1", (v,)),
-        ("SELECT entity_name AS n FROM entity WHERE entity_code=%s LIMIT 1", (v,)),
-        ("SELECT category AS n FROM main_category WHERE id=%s LIMIT 1", (v,)),
-        ("SELECT category AS n FROM secondary_category WHERE id=%s LIMIT 1", (v,)),
-    ]
-
-    for sql, params in queries:
-        try:
-            row = fetch_one(sql, params)
-            if row and row.get("n"):
-                return str(row["n"])
-        except Exception:
-            continue
-
-    return ""
+    return rows
 
 
 # ==============================
@@ -589,29 +476,30 @@ def fill_vessel_information_sheet(
 
     company = vget("company_name", "company")
     vname = vget("vessel_name")
-    imo = vget("vessel_IMO", "vessel_imo")
+    imo = vget("vessel_IMO", "vessel_imo", "vessel_imo")
     notes = vget("vessel_notes", "notes")
 
     purchasing = vget("purchasing_email", "purchasing_mail", "purchasing")
     if not purchasing:
         purchasing = vget("vessel_contact_email", "email")
 
-    flag_raw = vget("vessel_flag_name", "vessel_flag", "flag", "vessel_flag_id", default="")
-    flag_name = lookup_flag_name(str(flag_raw)) if flag_raw else ""
+    # use enriched names directly
+    flag_name = vget("vessel_flag_name", default="")
+    if not flag_name:
+        flag_name = vget("vessel_flag", default="")
 
-    cat_raw = vget("vessel_category_name", "vessel_category", "category_name", "vessel_category_id", default="")
-    cat_name = lookup_vessel_category_name(str(cat_raw)) if cat_raw else ""
-    if (not cat_name) and cat_raw:
-        cat_name = str(cat_raw)
+    cat_name = vget("vessel_category_name", default="")
+    if not cat_name:
+        cat_name = vget("vessel_category", default="")
 
-    malaria = yesno_or_blank(vget("malaria_medicine", "malaria_area", default=None))
+    malaria = yesno_or_blank(vget("malaria_area", "malaria_medicine", default=None))
     mfag = yesno_or_blank(vget("mfag", default=None))
-    female = yesno_or_blank(vget("female_onboard", "female", default=None))
-    dang = yesno_or_blank(vget("dangerous_good", "dangerous_goods", default=None))
+    female = yesno_or_blank(vget("female_onboard", default=None))
+    dang = yesno_or_blank(vget("dangerous_good", default=None))
     narc = yesno_or_blank(vget("narcotics", default=None))
     oxygen = yesno_or_blank(vget("medical_oxygen", default=None))
 
-    cool_v = vget("cool_items", "cool_goods", "coolgoods", "cool", default=None)
+    cool_v = vget("cool_goods", "cool_items", default=None)
     cool = yesno_or_blank(cool_v)
     if cool == "" and rows_for_derived:
         has_cool = any("cool good" in str(r.get("item_type") or "").lower() for r in rows_for_derived)
@@ -649,14 +537,14 @@ def fill_vessel_information_sheet(
     safe_set(ws, "C10", txt(vget("vessel_crew_size")))
     safe_set(ws, "E10", narc)
 
-    # Template value cell for months is I11 (label is in I9)
+    # months value cell is I11 (label is in I9)
     safe_set(ws, "I11", em if em not in (None, "") else "")
 
     safe_set(ws, "A12", txt(purchasing))
     safe_set(ws, "C12", txt(cat_name))
     safe_set(ws, "E12", oxygen)
 
-    # Certificates list: K/L rows 4-12 (9 rows)
+    # certificates list: K/L rows 4-12
     today = date.today()
     for r in range(4, 13):
         ws[f"K{r}"].value = None
@@ -819,7 +707,6 @@ def fill_upload_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[str, 
 
 
 def build_workbook_bytes(
-    excel_row: Dict[str, Any],
     rows: List[Dict[str, Any]],
     vessel: Dict[str, Any],
     vessel_id: str,
@@ -893,7 +780,7 @@ def download_file(excel_id: str, token: str):
     certs = get_latest_certificates_by_pack(vessel_id)
     storages = get_vessel_storages(vessel_id)
 
-    content = build_workbook_bytes(excel_row, rows, vessel, vessel_id, certs, storages)
+    content = build_workbook_bytes(rows, vessel, vessel_id, certs, storages)
     filename = build_filename(vessel, vessel_id)
 
     safe_name = filename.replace('"', "").replace("\n", " ").replace("\r", " ")
@@ -925,7 +812,7 @@ def email(excel_id: str, token: str, to_email: str):
     certs = get_latest_certificates_by_pack(vessel_id)
     storages = get_vessel_storages(vessel_id)
 
-    content = build_workbook_bytes(excel_row, rows, vessel, vessel_id, certs, storages)
+    content = build_workbook_bytes(rows, vessel, vessel_id, certs, storages)
     filename = build_filename(vessel, vessel_id)
 
     subject = f"Medical Inventory List - {vessel.get('vessel_name','')}".strip()
