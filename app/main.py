@@ -27,7 +27,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "app/templates/inventory_template 2.05.xlsx")
+# You uploaded inventory_template 2.06.xlsx; keep env override possible
+TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "app/templates/inventory_template 2.06.xlsx")
 
 INVENTORY_SHEET = os.getenv("INVENTORY_SHEET", "Inventory")
 VESSEL_INFO_SHEET = os.getenv("VESSEL_INFO_SHEET", "Vessel Information")
@@ -197,7 +198,7 @@ def safe_set(ws, addr: str, value, number_format: Optional[str] = None):
 
 
 # ==============================
-# Item type -> letters
+# Item type -> letters (N/M/C/D/F/O)
 # ==============================
 
 def letters_from_item_type(item_type: Any) -> Set[str]:
@@ -218,6 +219,7 @@ def letters_from_item_type(item_type: Any) -> Set[str]:
         out.add("M")
 
     return out
+
 
 # ==============================
 # excel_id lookup + token
@@ -262,7 +264,7 @@ def _json_as_dict(v: Any) -> Dict[str, Any]:
 
 
 def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
-    # vw_vessels_enriched already includes vessel_flag_name + vessel_category_name
+    # vw_vessels_enriched includes vessel_flag_name + vessel_category_name
     try:
         row = fetch_one(
             "SELECT to_jsonb(t) AS j FROM vw_vessels_enriched t WHERE t.vessel_id=%s",
@@ -373,6 +375,9 @@ def get_vessel_storages(vessel_id: str) -> List[Dict[str, Any]]:
 
 
 def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
+    """
+    Includes item_status + item_type + classification info.
+    """
     sql = """
         SELECT
           v.vessel_item_id,
@@ -405,6 +410,8 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
     for r in rows:
         if "item_type" not in r:
             r["item_type"] = ""
+        if "item_status" not in r:
+            r["item_status"] = ""
     return rows
 
 
@@ -490,14 +497,9 @@ def fill_vessel_information_sheet(
     if not purchasing:
         purchasing = vget("vessel_contact_email", "email")
 
-    # use enriched names directly
-    flag_name = vget("vessel_flag_name", default="")
-    if not flag_name:
-        flag_name = vget("vessel_flag", default="")
-
-    cat_name = vget("vessel_category_name", default="")
-    if not cat_name:
-        cat_name = vget("vessel_category", default="")
+    # Use enriched names directly (already verified in DB)
+    flag_name = vget("vessel_flag_name", default="") or vget("vessel_flag", default="")
+    cat_name = vget("vessel_category_name", default="") or vget("vessel_category", default="")
 
     malaria = yesno_or_blank(vget("malaria_area", "malaria_medicine", default=None))
     mfag = yesno_or_blank(vget("mfag", default=None))
@@ -594,13 +596,17 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[st
     c_cert = col_required("Certificate qty")
     c_exp = col_required("Expiry date")
     c_law = col_required("Law code")
+
+    # NEW column (you added in template 2.06)
+    c_status = col_required("Status")
+
     c_pack = col_required("Pack name")
 
     c_class = {k: col_optional(k) for k in CLASS_LETTERS}
 
     # clear old rows
     for r in range(2, MAX_ROWS + 2):
-        for cidx in (c_storage, c_article, c_item, c_qty, c_total, c_cert, c_exp, c_law, c_pack):
+        for cidx in (c_storage, c_article, c_item, c_qty, c_total, c_cert, c_exp, c_law, c_status, c_pack):
             ws.cell(r, cidx).value = None
         for _, cidx in c_class.items():
             if cidx:
@@ -641,6 +647,10 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[st
             ws.cell(r, c_exp).value = None
 
         ws.cell(r, c_law).value = rr.get("vessel_item_law_code") or ""
+
+        # NEW: item_status into Status column
+        ws.cell(r, c_status).value = rr.get("item_status") or ""
+
         ws.cell(r, c_pack).value = rr.get("pack_name") or ""
 
         flags: Set[str] = set()
@@ -705,6 +715,7 @@ def fill_upload_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[str, 
         setv(r, "certificate_qty_sql", num(rr.get("certificate_qty_sql")) or 0)
         setv(r, "pack_name", rr.get("pack_name") or "")
         setv(r, "item_type", rr.get("item_type") or "")
+        setv(r, "item_status", rr.get("item_status") or "")
 
         if d:
             setv(r, "vessel_item_expiration_date", d)
