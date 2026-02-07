@@ -1,23 +1,28 @@
-# Vessel Excel Export (FastAPI)
+# Vessel Excel Export (FleetMed)
 
-Service that generates an Excel “Medical Inventory List” for a vessel using a template workbook and data from PostgreSQL.
+FastAPI service that generates an Excel file (based on a template) for a vessel inventory export.
 
 ## Endpoints
 
-- `GET /health` → `{ "ok": true }`
-- `GET /download?excel_id=...&token=...`
-  - If the row is not yet visible in DB, returns a self-refreshing HTML “Preparing…” page.
-  - Otherwise redirects (302) to `/download_file`.
-- `GET /download_file?excel_id=...&token=...` → downloads the Excel file
-- `GET /email?excel_id=...&token=...&to_email=...` → emails the Excel file as attachment
+- `GET /health`  
+  Returns `{"ok": true}`
 
-## Required environment variables
+- `GET /download?excel_id=...&token=...`  
+  Returns a redirect to `/download_file`.  
+  If the `excel_id` is not yet available (race after AppSheet save), returns a self-refreshing wait page.
 
-- `DATABASE_URL` (required)  
-  Example: `postgresql://user:pass@host:5432/dbname`
+- `GET /download_file?excel_id=...&token=...`  
+  Generates and downloads the Excel file.
 
-## Optional environment variables
+- `GET /email?excel_id=...&token=...&to_email=...`  
+  Generates the Excel file and sends it as an email attachment.
 
+## Environment variables
+
+Required:
+- `DATABASE_URL`
+
+Optional:
 - `TEMPLATE_PATH` (default: `app/templates/inventory_template.xlsx`)
 - `INVENTORY_SHEET` (default: `Inventory`)
 - `VESSEL_INFO_SHEET` (default: `Vessel Information`)
@@ -25,48 +30,18 @@ Service that generates an Excel “Medical Inventory List” for a vessel using 
 - `STORAGE_SHEET` (default: `Storage`)
 - `MAX_ROWS` (default: `3000`)
 
-### SMTP (only needed for `/email`)
+SMTP (only needed if using `/email`):
 - `SMTP_HOST`
-- `SMTP_PORT` (default: `587`)
+- `SMTP_PORT` (default `587`)
 - `SMTP_USER`
 - `SMTP_PASSWORD`
-- `SMTP_USE_TLS` (default: `true`)
-- `FROM_EMAIL` (default: `SMTP_USER` or `no-reply@example.com`)
-- `FROM_NAME` (default: `Inventory Export`)
-
-## Template expectations
-
-Workbook should include at least:
-
-### Inventory sheet
-Headers must contain:
-- `Storage`, `Article No.`, `Item name`, `Quantity`, `Total quantity`, `Certificate qty`, `Expiry date`, `Law code`, `Pack name`
-And classification columns:
-- `N`, `M`, `C`, `D`, `F`, `O`
-
-### Vessel Information sheet (template 2.03 mapping)
-- Company: `A4`
-- Vessel name: `C4`
-- Malaria medicine: `E4`
-- MFAG: `G4`
-- Next resupply: `I4`
-- Certificates (multi-line): `K4`
-- Notes: `N4` (merged area)
-- Female onboard: `E6`
-- Cool Items: `G6`
-- Flag: `C8`
-- Vessel Category: `C12`
-- Medical oxygen: `E12`
-
-### Storage sheet
-Columns:
-- `A1` = `Storage Name`
-- `B1` = `storage_id`
-The service fills rows 2..N with vessel storages (sorted).
+- `SMTP_USE_TLS` (default `true`)
+- `FROM_EMAIL`
+- `FROM_NAME`
 
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
 export DATABASE_URL="postgresql://..."
-uvicorn app.main:app --host 0.0.0.0 --port 8080
+uvicorn app.main:app --reload --port 8080
