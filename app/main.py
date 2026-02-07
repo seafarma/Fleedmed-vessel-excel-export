@@ -201,18 +201,38 @@ def safe_set(ws, addr: str, value, number_format: Optional[str] = None):
 
 
 # ==============================
-# excel_id lookup + token
+# Item-type -> N/M/C/D/F/O helper
 # ==============================
 
-def get_excel_row(excel_id: str) -> Dict[str, Any]:
-    row = fetch_one(
-        "SELECT excel_id, vessel_id, export_token FROM vessel_excel WHERE excel_id=%s",
-        (excel_id,),
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="excel_id not found")
-    return row
+def letters_from_item_type(item_type: Any) -> Set[str]:
+    """
+    item_type comes from AppSheet EnumList, examples:
+      "🔵Cool Good,🟣Female Gender"
+      "🟠Narcotic"
+    We ignore emojis and just search for words.
+    """
+    s = str(item_type or "").lower()
+    out: Set[str] = set()
 
+    if "cool good" in s:
+        out.add("C")
+    if "narcotic" in s:
+        out.add("N")
+    if "dangerous" in s:
+        out.add("D")
+    if "medical oxygen" in s or re.search(r"\boxygen\b", s):
+        out.add("O")
+    if "malaria" in s:
+        out.add("M")
+    if "female" in s:
+        out.add("F")
+
+    return out
+
+
+# ==============================
+# excel_id lookup + token
+# ==============================
 
 def get_excel_row_retry(excel_id: str, max_wait_s: float = 6.0, step_s: float = 0.25) -> Optional[Dict[str, Any]]:
     deadline = time.time() + max_wait_s
@@ -280,9 +300,6 @@ def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
 
 
 def get_vessel_core_fields(vessel_id: str) -> Dict[str, Any]:
-    """
-    Minimal vessel fields from vessels table (fallback if vw_vessels_enriched misses something).
-    """
     try:
         row = fetch_one(
             'SELECT vessel_name, "vessel_IMO" AS vessel_imo, vessel_contact_name, vessel_contact_email, vessel_contact_phone, vessel_crew_size, vessel_notes, purchasing_email FROM vessels WHERE vessel_id=%s',
@@ -294,9 +311,6 @@ def get_vessel_core_fields(vessel_id: str) -> Dict[str, Any]:
 
 
 def get_latest_certificates_by_pack(vessel_id: str) -> List[Dict[str, Any]]:
-    """
-    One row per pack linked to the vessel, with latest certificate_end_date.
-    """
     try:
         return fetch_all(
             """
@@ -317,9 +331,6 @@ def get_latest_certificates_by_pack(vessel_id: str) -> List[Dict[str, Any]]:
 
 
 def compute_next_resupply_date(certs: List[Dict[str, Any]]) -> Optional[date]:
-    """
-    Next resupply = earliest (certificate_end_date - 30 days) across NON-expired certificates.
-    """
     today = date.today()
     candidates: List[date] = []
     for c in certs or []:
@@ -330,9 +341,6 @@ def compute_next_resupply_date(certs: List[Dict[str, Any]]) -> Optional[date]:
 
 
 def get_vessel_storages(vessel_id: str) -> List[Dict[str, Any]]:
-    """
-    Fill Storage sheet: Storage Name + storage_id sorted.
-    """
     candidates: List[Tuple[str, Tuple[Any, ...]]] = [
         (
             """
@@ -377,8 +385,7 @@ def get_vessel_storages(vessel_id: str) -> List[Dict[str, Any]]:
 
 def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
     """
-    Export rows from vw_vessel_excel_items.
-    NOTE: we filter qty>0 in Python (safer across schemas/types).
+    Pull rows from vw_vessel_excel_items, including item_type (EnumList) so we can set C per row.
     """
     sql = """
         SELECT
@@ -397,7 +404,8 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
           v.certificate_qty_sql,
           v.vessel_item_expiration_date,
           v.pack_name,
-          v.item_classification_export
+          v.item_classification_export,
+          v.item_type
         FROM vw_vessel_excel_items v
         WHERE v.excel_id=%s
         ORDER BY
@@ -409,7 +417,7 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
     try:
         return fetch_all(sql, (excel_id,))
     except Exception:
-        # fallback if view doesn't have item_classification_export
+        # fallback: if item_type column not present yet
         sql2 = """
             SELECT
               v.vessel_item_id,
@@ -426,7 +434,8 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
               v.totalitem_qty_sql,
               v.certificate_qty_sql,
               v.vessel_item_expiration_date,
-              v.pack_name
+              v.pack_name,
+              v.item_classification_export
             FROM vw_vessel_excel_items v
             WHERE v.excel_id=%s
             ORDER BY
@@ -437,7 +446,7 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
         """
         rows = fetch_all(sql2, (excel_id,))
         for r in rows:
-            r["item_classification_export"] = None
+            r["item_type"] = ""
         return rows
 
 
@@ -447,8 +456,7 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
 
 def lookup_flag_name(flag_code_or_id: str) -> str:
     """
-    Turn 'AAA-0166' into flag name if possible.
-    If lookup tables don't exist, we keep the code.
+    Tries to resolve AAA-xxxx to readable name. If no mapping table, keeps code.
     """
     v = (flag_code_or_id or "").strip()
     if not v:
@@ -458,18 +466,13 @@ def lookup_flag_name(flag_code_or_id: str) -> str:
     if not _FLAG_CODE_RE.match(v) and not looks_like_uuid(v) and not looks_like_short_id(v):
         return v
 
-    # Best-effort lookups (may not exist in your schema)
+    # Best-effort lookups (schema differs; many DBs have `entity`, some have flags tables)
     queries: List[Tuple[str, Tuple[Any, ...]]] = [
-        ("SELECT entity_name AS n FROM entities WHERE entity_code=%s LIMIT 1", (v,)),
-        ("SELECT entity_name AS n FROM entities WHERE entity_code ILIKE %s LIMIT 1", (v,)),
+        ("SELECT entity_name AS n FROM entity WHERE entity_code=%s LIMIT 1", (v,)),
+        ("SELECT entity_name AS n FROM entity WHERE entity_id=%s LIMIT 1", (v,)),
         ("SELECT vessel_flag_name AS n FROM vessel_flags WHERE vessel_flag_id=%s LIMIT 1", (v,)),
-        ("SELECT entity_name AS n FROM vessel_flags WHERE vessel_flag_id=%s LIMIT 1", (v,)),
         ("SELECT flag_name AS n FROM flags WHERE flag_id=%s LIMIT 1", (v,)),
-        ("SELECT entity_name AS n FROM flags WHERE flag_id=%s LIMIT 1", (v,)),
     ]
-
-    if looks_like_uuid(v):
-        queries.insert(1, ("SELECT entity_name AS n FROM entities WHERE entity_id=%s LIMIT 1", (v,)))
 
     for sql, params in queries:
         try:
@@ -484,8 +487,7 @@ def lookup_flag_name(flag_code_or_id: str) -> str:
 
 def lookup_vessel_category_name(cat_id_or_name: str) -> str:
     """
-    Resolve vessel category id to name. If already a label, keep it.
-    Supports UUID and 8-hex short ids.
+    Resolve vessel category id to label if possible. If not found, return "".
     """
     v = (cat_id_or_name or "").strip()
     if not v:
@@ -494,126 +496,22 @@ def lookup_vessel_category_name(cat_id_or_name: str) -> str:
     if not looks_like_uuid(v) and not looks_like_short_id(v):
         return v
 
-    # Best-effort candidates (schema can differ)
-    candidates = [
-        ("vessel_categories", "category_name", "vessel_category_id"),
-        ("vessel_categories", "vessel_category_name", "vessel_category_id"),
-        ("vessel_categories", "category_name", "category_id"),
-        ("vessel_categories", "vessel_category_name", "category_id"),
-        ("vessel_category", "category_name", "vessel_category_id"),
-        ("vessel_category", "vessel_category_name", "vessel_category_id"),
-        ("vessel_category", "category_name", "category_id"),
-        ("vessel_category", "vessel_category_name", "category_id"),
-        ("main_category", "category", "id"),
-        ("secondary_category", "category", "id"),
+    queries: List[Tuple[str, Tuple[Any, ...]]] = [
+        ("SELECT entity_name AS n FROM entity WHERE entity_id=%s LIMIT 1", (v,)),
+        ("SELECT entity_name AS n FROM entity WHERE entity_code=%s LIMIT 1", (v,)),
+        ("SELECT category AS n FROM main_category WHERE id=%s LIMIT 1", (v,)),
+        ("SELECT category AS n FROM secondary_category WHERE id=%s LIMIT 1", (v,)),
     ]
-    for table, namecol, idcol in candidates:
+
+    for sql, params in queries:
         try:
-            row = fetch_one(f"SELECT {namecol} AS n FROM {table} WHERE {idcol}=%s LIMIT 1", (v,))
+            row = fetch_one(sql, params)
             if row and row.get("n"):
                 return str(row["n"])
         except Exception:
             continue
 
     return ""
-
-
-# ==============================
-# Classification parsing (best-effort)
-# ==============================
-
-_CLASS_CACHE: Dict[str, str] = {}
-
-
-def resolve_classification_to_codes(v: Any) -> str:
-    """
-    Normalize item_classification_export.
-
-    - If value looks like an ID (UUID or 8-hex), try to resolve it via known lookup tables.
-    - Otherwise return it as text (labels like 'Analgesics', 'Antibiotics', etc.).
-    """
-    if v is None:
-        return ""
-
-    s = str(v).strip()
-    if not s:
-        return ""
-
-    is_id = looks_like_uuid(s) or looks_like_short_id(s)
-    if not is_id:
-        return s
-
-    if s in _CLASS_CACHE:
-        return _CLASS_CACHE[s]
-
-    candidates = [
-        ("main_category", "id", "category"),
-        ("secondary_category", "id", "category"),
-        ("item_classifications", "classification_id", "classification_code"),
-        ("item_classifications", "classification_id", "code"),
-        ("item_classification", "classification_id", "classification_code"),
-        ("item_classification", "classification_id", "code"),
-        ("classifications", "classification_id", "classification_code"),
-        ("classifications", "classification_id", "code"),
-    ]
-
-    for table, idcol, codecol in candidates:
-        try:
-            row = fetch_one(f"SELECT {codecol} AS code FROM {table} WHERE {idcol}=%s LIMIT 1", (s,))
-            if row and row.get("code"):
-                _CLASS_CACHE[s] = str(row["code"])
-                return _CLASS_CACHE[s]
-        except Exception:
-            continue
-
-    _CLASS_CACHE[s] = ""
-    return ""
-
-
-def parse_item_classification(v: Any) -> Set[str]:
-    """
-    Parse item_classification_export into {N,M,C,D,F,O}.
-    Supports codes "N,M", "NMCFO" and keywords.
-    Avoids false positives (e.g. "COOL" should not trigger O).
-    """
-    raw = resolve_classification_to_codes(v)
-    if raw is None:
-        return set()
-
-    s = str(raw).strip()
-    if not s:
-        return set()
-
-    s_lower = s.lower()
-    out: Set[str] = set()
-
-    # token based (safe)
-    tokens = re.split(r"[^A-Za-z0-9]+", s.upper())
-    for t in tokens:
-        t = t.strip()
-        if not t:
-            continue
-        if t in CLASS_LETTERS:
-            out.add(t)
-            continue
-        if re.fullmatch(r"[NMCDFO]+", t) and len(t) > 1:
-            out.update(set(t))
-
-    # keyword based
-    if "narc" in s_lower:
-        out.add("N")
-    if "malar" in s_lower:
-        out.add("M")
-    if any(k in s_lower for k in ("cool", "cold", "fridge", "refrig", "chill")):
-        out.add("C")
-    if any(k in s_lower for k in ("dang", "danger")):
-        out.add("D")
-    if any(k in s_lower for k in ("fem", "female", "women", "woman")):
-        out.add("F")
-    if any(k in s_lower for k in ("oxygen", "o2", "o-2", "oxyg")):
-        out.add("O")
-
-    return set([x for x in out if x in CLASS_LETTERS])
 
 
 # ==============================
@@ -716,16 +614,13 @@ def fill_vessel_information_sheet(
     cool_v = vget("cool_items", "cool_goods", "coolgoods", "cool", default=None)
     cool = yesno_or_blank(cool_v)
     if cool == "" and rows_for_derived:
-        has_cool = any("C" in parse_item_classification(r.get("item_classification_export")) for r in rows_for_derived)
+        has_cool = any("cool good" in str(r.get("item_type") or "").lower() for r in rows_for_derived)
         if has_cool:
             cool = "Yes"
 
     agreement = vget("vessel_subscription_type", "resupply_agreement", "subscription_type")
     rr = vget("resupply_rate", default="")
     em = vget("expiration_months", default="")
-
-    # Template mapping inventory_template 2.03:
-    # labels rows 3/5/7/9/11 -> values rows 4/6/8/10/12
 
     safe_set(ws, "A4", txt(company))
     safe_set(ws, "C4", txt(vname))
@@ -754,7 +649,7 @@ def fill_vessel_information_sheet(
     safe_set(ws, "C10", txt(vget("vessel_crew_size")))
     safe_set(ws, "E10", narc)
 
-    # Important: template value cell for months is I11 (label is in I9)
+    # Template value cell for months is I11 (label is in I9)
     safe_set(ws, "I11", em if em not in (None, "") else "")
 
     safe_set(ws, "A12", txt(purchasing))
@@ -780,7 +675,7 @@ def fill_vessel_information_sheet(
             safe_set(ws, f"L{row}", "Expired")
 
 
-def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[str, str], vessel: Optional[Dict[str, Any]] = None):
+def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[str, str]):
     headers = {}
     for c in range(1, ws.max_column + 1):
         v = ws.cell(1, c).value
@@ -808,6 +703,7 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[st
 
     c_class = {k: col_optional(k) for k in CLASS_LETTERS}
 
+    # clear old rows
     for r in range(2, MAX_ROWS + 2):
         for cidx in (c_storage, c_article, c_item, c_qty, c_total, c_cert, c_exp, c_law, c_pack):
             ws.cell(r, cidx).value = None
@@ -852,21 +748,8 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[st
         ws.cell(r, c_law).value = rr.get("vessel_item_law_code") or ""
         ws.cell(r, c_pack).value = rr.get("pack_name") or ""
 
-        flags = parse_item_classification(rr.get("item_classification_export"))
-        # Vessel-level fallback for N/M/C/D/F/O (matches the sheet meaning)
-        v = vessel or {}
-if to_bool(v.get("narcotics")) is True:
-    flags.add("N")
-if to_bool(v.get("malaria_area")) is True:
-    flags.add("M")
-if to_bool(v.get("cool_goods")) is True:
-    flags.add("C")
-if to_bool(v.get("dangerous_good")) is True:
-    flags.add("D")
-if to_bool(v.get("female_onboard")) is True:
-    flags.add("F")
-if to_bool(v.get("medical_oxygen")) is True:
-    flags.add("O")
+        flags: Set[str] = set()
+        flags |= letters_from_item_type(rr.get("item_type"))
 
         for letter in CLASS_LETTERS:
             cidx = c_class.get(letter)
@@ -926,6 +809,7 @@ def fill_upload_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[str, 
         setv(r, "totalitem_qty_sql", num(rr.get("totalitem_qty_sql")) or 0)
         setv(r, "certificate_qty_sql", num(rr.get("certificate_qty_sql")) or 0)
         setv(r, "pack_name", rr.get("pack_name") or "")
+        setv(r, "item_type", rr.get("item_type") or "")
 
         if d:
             setv(r, "vessel_item_expiration_date", d)
@@ -955,7 +839,7 @@ def build_workbook_bytes(
     ws_inv = find_sheet_fuzzy(wb, INVENTORY_SHEET)
     if ws_inv is None:
         raise HTTPException(status_code=500, detail=f"Sheet '{INVENTORY_SHEET}' not found in template")
-    fill_inventory_sheet(ws_inv, rows, storages_by_id, vessel)
+    fill_inventory_sheet(ws_inv, rows, storages_by_id)
 
     ws_up = find_sheet_fuzzy(wb, UPLOAD_SHEET)
     if ws_up is not None:
@@ -1001,11 +885,9 @@ def download_file(excel_id: str, token: str):
     validate_token(excel_row, token)
 
     vessel_id = excel_row["vessel_id"]
-
     vessel = try_get_vessel_json(vessel_id)
-    rows = get_export_rows(excel_id)
 
-    # Filter qty > 0 (requested)
+    rows = get_export_rows(excel_id)
     rows = [r for r in (rows or []) if (num(r.get("vessel_item_quantity")) or 0) > 0]
 
     certs = get_latest_certificates_by_pack(vessel_id)
