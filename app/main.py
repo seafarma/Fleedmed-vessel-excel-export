@@ -4,6 +4,7 @@ import re
 import smtplib
 import time
 import secrets
+import json
 from email.message import EmailMessage
 from datetime import datetime, date, timedelta
 from decimal import Decimal
@@ -93,6 +94,7 @@ def fetch_all(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
 # ==============================
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$")  # your data uses 8-hex ids (e.g. 5c1a77f3, 8eb4d88d)
 _FLAG_CODE_RE = re.compile(r"^[A-Z]{3}-\d+$")
 
 
@@ -100,6 +102,12 @@ def looks_like_uuid(v: Any) -> bool:
     if not v:
         return False
     return bool(_UUID_RE.match(str(v).strip()))
+
+
+def looks_like_short_id(v: Any) -> bool:
+    if not v:
+        return False
+    return bool(_SHORT_ID_RE.match(str(v).strip()))
 
 
 def to_bool(v) -> Optional[bool]:
@@ -230,6 +238,20 @@ def validate_token(excel_row: Dict[str, Any], token: str):
 # Data retrieval
 # ==============================
 
+def _json_as_dict(v: Any) -> Dict[str, Any]:
+    if not v:
+        return {}
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            x = json.loads(v)
+            return x if isinstance(x, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
     # Prefer enriched view; fallback vessels
     try:
@@ -237,24 +259,30 @@ def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
             "SELECT to_jsonb(t) AS j FROM vw_vessels_enriched t WHERE t.vessel_id=%s",
             (vessel_id,),
         )
-        if row and row.get("j"):
-            return row["j"]
+        j = _json_as_dict((row or {}).get("j"))
+        if j:
+            return j
     except Exception:
         pass
 
-    row2 = fetch_one(
-        "SELECT to_jsonb(v) AS j FROM vessels v WHERE v.vessel_id=%s",
-        (vessel_id,),
-    )
-    if row2 and row2.get("j"):
-        return row2["j"]
+    try:
+        row2 = fetch_one(
+            "SELECT to_jsonb(v) AS j FROM vessels v WHERE v.vessel_id=%s",
+            (vessel_id,),
+        )
+        j2 = _json_as_dict((row2 or {}).get("j"))
+        if j2:
+            return j2
+    except Exception:
+        pass
+
     return {}
 
 
 def get_vessel_core_fields(vessel_id: str) -> Dict[str, Any]:
     """
-    Minimal vessel fields from vessels table (fallback if vw_vessels_enriched misses something).
-    This query is wrapped in try/except because schemas can differ.
+    Fallback minimal vessel fields.
+    Uses common column names; if your schema differs, adjust this query.
     """
     try:
         row = fetch_one(
@@ -427,7 +455,7 @@ def lookup_flag_name(flag_code_or_id: str) -> str:
         return ""
 
     # If already readable, keep it
-    if not _FLAG_CODE_RE.match(v) and not looks_like_uuid(v):
+    if not _FLAG_CODE_RE.match(v) and not looks_like_uuid(v) and not looks_like_short_id(v):
         return v
 
     queries: List[Tuple[str, Tuple[Any, ...]]] = [
@@ -456,12 +484,14 @@ def lookup_flag_name(flag_code_or_id: str) -> str:
 def lookup_vessel_category_name(cat_id_or_name: str) -> str:
     """
     Resolve vessel category id to name. If already a label, keep it.
+    Supports UUID and 8-hex short ids.
     """
     v = (cat_id_or_name or "").strip()
     if not v:
         return ""
 
-    if not looks_like_uuid(v):
+    # If it's not an id, it's probably already a label
+    if not looks_like_uuid(v) and not looks_like_short_id(v):
         return v
 
     candidates = [
@@ -473,6 +503,9 @@ def lookup_vessel_category_name(cat_id_or_name: str) -> str:
         ("vessel_category", "vessel_category_name", "vessel_category_id"),
         ("vessel_category", "category_name", "category_id"),
         ("vessel_category", "vessel_category_name", "category_id"),
+        # sometimes categories are also entities
+        ("entities", "entity_name", "entity_id"),
+        ("entities", "entity_name", "entity_code"),
     ]
     for table, namecol, idcol in candidates:
         try:
@@ -486,19 +519,73 @@ def lookup_vessel_category_name(cat_id_or_name: str) -> str:
 
 
 # ==============================
-# Classification parsing
+# Classification parsing (supports ID -> code lookup)
 # ==============================
+
+_CLASS_CACHE: Dict[str, str] = {}
+
+
+def resolve_classification_to_codes(v: Any) -> str:
+    """
+    If v already contains letters, return it.
+    If v looks like an id (8-hex or UUID), look it up in a classification table.
+    Returns a string like 'N,M' or 'C' or ''.
+    """
+    if v is None:
+        return ""
+
+    s = str(v).strip()
+    if not s:
+        return ""
+
+    # already looks like codes/text
+    if any(ch in s.upper() for ch in CLASS_LETTERS):
+        return s
+
+    is_id = looks_like_uuid(s) or looks_like_short_id(s)
+    if not is_id:
+        return s
+
+    if s in _CLASS_CACHE:
+        return _CLASS_CACHE[s]
+
+    candidates = [
+        ("item_classifications", "classification_id", "classification_code"),
+        ("item_classifications", "classification_id", "code"),
+        ("item_classification", "classification_id", "classification_code"),
+        ("item_classification", "classification_id", "code"),
+        ("classifications", "classification_id", "classification_code"),
+        ("classifications", "classification_id", "code"),
+        ("vessel_item_classifications", "classification_id", "classification_code"),
+        ("vessel_item_classifications", "classification_id", "code"),
+        ("entities", "entity_id", "entity_code"),
+        ("entities", "entity_id", "entity_name"),
+    ]
+
+    for table, idcol, codecol in candidates:
+        try:
+            row = fetch_one(f"SELECT {codecol} AS code FROM {table} WHERE {idcol}=%s LIMIT 1", (s,))
+            if row and row.get("code"):
+                _CLASS_CACHE[s] = str(row["code"])
+                return _CLASS_CACHE[s]
+        except Exception:
+            continue
+
+    _CLASS_CACHE[s] = ""
+    return ""
+
 
 def parse_item_classification(v: Any) -> Set[str]:
     """
     Parse item_classification_export into {N,M,C,D,F,O}.
     Supports codes "N,M", "NMCFO" and keywords.
-    Avoids false positives (e.g. "COOL" should not trigger O).
+    Also supports ID values by resolving them first.
     """
-    if v is None:
+    raw = resolve_classification_to_codes(v)
+    if raw is None:
         return set()
 
-    s = str(v).strip()
+    s = str(raw).strip()
     if not s:
         return set()
 
@@ -610,6 +697,7 @@ def fill_vessel_information_sheet(
     company = vget("company_name", "company")
     vname = vget("vessel_name")
     imo = vget("vessel_IMO", "vessel_imo")
+
     notes = vget("vessel_notes", "notes")
 
     purchasing = vget("purchasing_email", "purchasing_mail", "purchasing")
@@ -640,9 +728,7 @@ def fill_vessel_information_sheet(
     rr = vget("resupply_rate", default="")
     em = vget("expiration_months", default="")
 
-    # Template mapping inventory_template 2.03:
-    # labels rows 3/5/7/9/11 -> values rows 4/6/8/10/12
-
+    # Template mapping: labels rows 3/5/7/9/11 -> values rows 4/6/8/10/12
     safe_set(ws, "A4", txt(company))
     safe_set(ws, "C4", txt(vname))
     safe_set(ws, "E4", malaria)
@@ -669,7 +755,9 @@ def fill_vessel_information_sheet(
     safe_set(ws, "A10", txt(vget("vessel_contact_phone")))
     safe_set(ws, "C10", txt(vget("vessel_crew_size")))
     safe_set(ws, "E10", narc)
-    safe_set(ws, "I10", em if em not in (None, "") else "")
+
+    # Important: "Replace items expiring in months" value cell is I11 (not I9)
+    safe_set(ws, "I11", em if em not in (None, "") else "")
 
     safe_set(ws, "A12", txt(purchasing))
     safe_set(ws, "C12", txt(cat_name))
@@ -904,7 +992,7 @@ def download_file(excel_id: str, token: str):
     vessel = try_get_vessel_json(vessel_id)
     rows = get_export_rows(excel_id)
 
-    # Filter qty > 0 (requested)
+    # Filter qty > 0
     rows = [r for r in (rows or []) if (num(r.get("vessel_item_quantity")) or 0) > 0]
 
     certs = get_latest_certificates_by_pack(vessel_id)
