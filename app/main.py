@@ -94,7 +94,7 @@ def fetch_all(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
 # ==============================
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-_SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$")  # your data uses 8-hex ids (e.g. 5c1a77f3, 8eb4d88d)
+_SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 _FLAG_CODE_RE = re.compile(r"^[A-Z]{3}-\d+$")
 
 
@@ -281,8 +281,7 @@ def try_get_vessel_json(vessel_id: str) -> Dict[str, Any]:
 
 def get_vessel_core_fields(vessel_id: str) -> Dict[str, Any]:
     """
-    Fallback minimal vessel fields.
-    Uses common column names; if your schema differs, adjust this query.
+    Minimal vessel fields from vessels table (fallback if vw_vessels_enriched misses something).
     """
     try:
         row = fetch_one(
@@ -449,6 +448,7 @@ def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
 def lookup_flag_name(flag_code_or_id: str) -> str:
     """
     Turn 'AAA-0166' into flag name if possible.
+    If lookup tables don't exist, we keep the code.
     """
     v = (flag_code_or_id or "").strip()
     if not v:
@@ -458,6 +458,7 @@ def lookup_flag_name(flag_code_or_id: str) -> str:
     if not _FLAG_CODE_RE.match(v) and not looks_like_uuid(v) and not looks_like_short_id(v):
         return v
 
+    # Best-effort lookups (may not exist in your schema)
     queries: List[Tuple[str, Tuple[Any, ...]]] = [
         ("SELECT entity_name AS n FROM entities WHERE entity_code=%s LIMIT 1", (v,)),
         ("SELECT entity_name AS n FROM entities WHERE entity_code ILIKE %s LIMIT 1", (v,)),
@@ -490,10 +491,10 @@ def lookup_vessel_category_name(cat_id_or_name: str) -> str:
     if not v:
         return ""
 
-    # If it's not an id, it's probably already a label
     if not looks_like_uuid(v) and not looks_like_short_id(v):
         return v
 
+    # Best-effort candidates (schema can differ)
     candidates = [
         ("vessel_categories", "category_name", "vessel_category_id"),
         ("vessel_categories", "vessel_category_name", "vessel_category_id"),
@@ -503,9 +504,8 @@ def lookup_vessel_category_name(cat_id_or_name: str) -> str:
         ("vessel_category", "vessel_category_name", "vessel_category_id"),
         ("vessel_category", "category_name", "category_id"),
         ("vessel_category", "vessel_category_name", "category_id"),
-        # sometimes categories are also entities
-        ("entities", "entity_name", "entity_id"),
-        ("entities", "entity_name", "entity_code"),
+        ("main_category", "category", "id"),
+        ("secondary_category", "category", "id"),
     ]
     for table, namecol, idcol in candidates:
         try:
@@ -519,7 +519,7 @@ def lookup_vessel_category_name(cat_id_or_name: str) -> str:
 
 
 # ==============================
-# Classification parsing (supports ID -> code lookup)
+# Classification parsing (best-effort)
 # ==============================
 
 _CLASS_CACHE: Dict[str, str] = {}
@@ -527,9 +527,10 @@ _CLASS_CACHE: Dict[str, str] = {}
 
 def resolve_classification_to_codes(v: Any) -> str:
     """
-    If v already contains letters, return it.
-    If v looks like an id (8-hex or UUID), look it up in a classification table.
-    Returns a string like 'N,M' or 'C' or ''.
+    Normalize item_classification_export.
+
+    - If value looks like an ID (UUID or 8-hex), try to resolve it via known lookup tables.
+    - Otherwise return it as text (labels like 'Analgesics', 'Antibiotics', etc.).
     """
     if v is None:
         return ""
@@ -537,10 +538,6 @@ def resolve_classification_to_codes(v: Any) -> str:
     s = str(v).strip()
     if not s:
         return ""
-
-    # already looks like codes/text
-    if any(ch in s.upper() for ch in CLASS_LETTERS):
-        return s
 
     is_id = looks_like_uuid(s) or looks_like_short_id(s)
     if not is_id:
@@ -550,16 +547,14 @@ def resolve_classification_to_codes(v: Any) -> str:
         return _CLASS_CACHE[s]
 
     candidates = [
+        ("main_category", "id", "category"),
+        ("secondary_category", "id", "category"),
         ("item_classifications", "classification_id", "classification_code"),
         ("item_classifications", "classification_id", "code"),
         ("item_classification", "classification_id", "classification_code"),
         ("item_classification", "classification_id", "code"),
         ("classifications", "classification_id", "classification_code"),
         ("classifications", "classification_id", "code"),
-        ("vessel_item_classifications", "classification_id", "classification_code"),
-        ("vessel_item_classifications", "classification_id", "code"),
-        ("entities", "entity_id", "entity_code"),
-        ("entities", "entity_id", "entity_name"),
     ]
 
     for table, idcol, codecol in candidates:
@@ -579,7 +574,7 @@ def parse_item_classification(v: Any) -> Set[str]:
     """
     Parse item_classification_export into {N,M,C,D,F,O}.
     Supports codes "N,M", "NMCFO" and keywords.
-    Also supports ID values by resolving them first.
+    Avoids false positives (e.g. "COOL" should not trigger O).
     """
     raw = resolve_classification_to_codes(v)
     if raw is None:
@@ -697,7 +692,6 @@ def fill_vessel_information_sheet(
     company = vget("company_name", "company")
     vname = vget("vessel_name")
     imo = vget("vessel_IMO", "vessel_imo")
-
     notes = vget("vessel_notes", "notes")
 
     purchasing = vget("purchasing_email", "purchasing_mail", "purchasing")
@@ -709,6 +703,8 @@ def fill_vessel_information_sheet(
 
     cat_raw = vget("vessel_category_name", "vessel_category", "category_name", "vessel_category_id", default="")
     cat_name = lookup_vessel_category_name(str(cat_raw)) if cat_raw else ""
+    if (not cat_name) and cat_raw:
+        cat_name = str(cat_raw)
 
     malaria = yesno_or_blank(vget("malaria_medicine", "malaria_area", default=None))
     mfag = yesno_or_blank(vget("mfag", default=None))
@@ -728,7 +724,9 @@ def fill_vessel_information_sheet(
     rr = vget("resupply_rate", default="")
     em = vget("expiration_months", default="")
 
-    # Template mapping: labels rows 3/5/7/9/11 -> values rows 4/6/8/10/12
+    # Template mapping inventory_template 2.03:
+    # labels rows 3/5/7/9/11 -> values rows 4/6/8/10/12
+
     safe_set(ws, "A4", txt(company))
     safe_set(ws, "C4", txt(vname))
     safe_set(ws, "E4", malaria)
@@ -756,7 +754,7 @@ def fill_vessel_information_sheet(
     safe_set(ws, "C10", txt(vget("vessel_crew_size")))
     safe_set(ws, "E10", narc)
 
-    # Important: "Replace items expiring in months" value cell is I11 (not I9)
+    # Important: template value cell for months is I11 (label is in I9)
     safe_set(ws, "I11", em if em not in (None, "") else "")
 
     safe_set(ws, "A12", txt(purchasing))
@@ -782,7 +780,7 @@ def fill_vessel_information_sheet(
             safe_set(ws, f"L{row}", "Expired")
 
 
-def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[str, str]):
+def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[str, str], vessel: Optional[Dict[str, Any]] = None):
     headers = {}
     for c in range(1, ws.max_column + 1):
         v = ws.cell(1, c).value
@@ -855,6 +853,21 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[st
         ws.cell(r, c_pack).value = rr.get("pack_name") or ""
 
         flags = parse_item_classification(rr.get("item_classification_export"))
+        # Vessel-level fallback for N/M/C/D/F/O (matches the sheet meaning)
+        v = vessel or {}
+        if v.get("narcotics") is True:
+            flags.add("N")
+        if v.get("malaria_area") is True:
+            flags.add("M")
+        if v.get("cool_goods") is True:
+            flags.add("C")
+        if v.get("dangerous_good") is True:
+            flags.add("D")
+        if v.get("female_onboard") is True:
+            flags.add("F")
+        if v.get("medical_oxygen") is True:
+            flags.add("O")
+
         for letter in CLASS_LETTERS:
             cidx = c_class.get(letter)
             if not cidx:
@@ -942,7 +955,7 @@ def build_workbook_bytes(
     ws_inv = find_sheet_fuzzy(wb, INVENTORY_SHEET)
     if ws_inv is None:
         raise HTTPException(status_code=500, detail=f"Sheet '{INVENTORY_SHEET}' not found in template")
-    fill_inventory_sheet(ws_inv, rows, storages_by_id)
+    fill_inventory_sheet(ws_inv, rows, storages_by_id, vessel)
 
     ws_up = find_sheet_fuzzy(wb, UPLOAD_SHEET)
     if ws_up is not None:
@@ -992,7 +1005,7 @@ def download_file(excel_id: str, token: str):
     vessel = try_get_vessel_json(vessel_id)
     rows = get_export_rows(excel_id)
 
-    # Filter qty > 0
+    # Filter qty > 0 (requested)
     rows = [r for r in (rows or []) if (num(r.get("vessel_item_quantity")) or 0) > 0]
 
     certs = get_latest_certificates_by_pack(vessel_id)
