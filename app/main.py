@@ -209,9 +209,18 @@ def letters_from_item_type(item_type: Any) -> Set[str]:
     out: Set[str] = set()
     if "cool good" in s:
         out.add("C")
+     if "narcotic" in s:
+        out.add("N")
+    if "dangerous" in s:
+        out.add("D")
+    if "female" in s:
+        out.add("F")
+    if "medical oxygen" in s or re.search(r"\boxygen\b", s):
+        out.add("O")
+    if "malaria" in s:
+        out.add("M")
+
     return out
-
-
 # ==============================
 # excel_id lookup + token
 # ==============================
