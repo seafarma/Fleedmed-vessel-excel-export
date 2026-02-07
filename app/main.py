@@ -28,7 +28,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
 # You uploaded inventory_template 2.06.xlsx; keep env override possible
-TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "app/templates/inventory_template 2.06.xlsx")
+TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "app/templates/inventory_template 2.07.xlsx")
 
 INVENTORY_SHEET = os.getenv("INVENTORY_SHEET", "Inventory")
 VESSEL_INFO_SHEET = os.getenv("VESSEL_INFO_SHEET", "Vessel Information")
