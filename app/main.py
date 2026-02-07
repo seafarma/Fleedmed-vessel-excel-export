@@ -27,7 +27,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-# You uploaded inventory_template 2.06.xlsx; keep env override possible
 TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "app/templates/inventory_template 2.07.xlsx")
 
 INVENTORY_SHEET = os.getenv("INVENTORY_SHEET", "Inventory")
@@ -222,16 +221,79 @@ def letters_from_item_type(item_type: Any) -> Set[str]:
 
 
 # ==============================
+# Filters from vessel_excel (AppSheet selectors)
+# ==============================
+
+def parse_enumlist(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    s = str(v).strip()
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def get_filters_from_excel_row(excel_row: Dict[str, Any]) -> Tuple[str, List[str]]:
+    # Status is Enum (Active/Scrap). Column name in vessel_excel is usually item_status.
+    status = str(
+        (excel_row or {}).get("item_status")
+        or (excel_row or {}).get("status")
+        or (excel_row or {}).get("status_filter")
+        or ""
+    ).strip()
+
+    # Storage selector is EnumList in AppSheet. Column name can differ; try common ones.
+    storage_raw = (
+        (excel_row or {}).get("storage")
+        or (excel_row or {}).get("storages")
+        or (excel_row or {}).get("storage_filter")
+        or (excel_row or {}).get("storage_display_filter")
+        or ""
+    )
+    storages = parse_enumlist(storage_raw)
+
+    return status, storages
+
+
+def apply_export_filters(rows: List[Dict[str, Any]], status: str, storages: List[str]) -> List[Dict[str, Any]]:
+    status_l = status.strip().lower()
+    stor_l = [s.strip().lower() for s in (storages or []) if s.strip()]
+
+    out = []
+    for r in rows or []:
+        # Always exclude qty <= 0
+        if (num(r.get("vessel_item_quantity")) or 0) <= 0:
+            continue
+
+        # Status filter (AND)
+        if status_l:
+            row_status = str(r.get("item_status") or "").strip().lower()
+            if row_status != status_l:
+                continue
+
+        # Storage filter (AND)
+        if stor_l:
+            sd = str(r.get("storage_display") or "").strip().lower()
+            sid = str(r.get("storage_id") or "").strip().lower()
+            if not any(sd == x or sid == x for x in stor_l):
+                continue
+
+        out.append(r)
+
+    return out
+
+
+# ==============================
 # excel_id lookup + token
 # ==============================
 
 def get_excel_row_retry(excel_id: str, max_wait_s: float = 6.0, step_s: float = 0.25) -> Optional[Dict[str, Any]]:
     deadline = time.time() + max_wait_s
     while True:
-        row = fetch_one(
-            "SELECT excel_id, vessel_id, export_token FROM vessel_excel WHERE excel_id=%s",
-            (excel_id,),
-        )
+        # SELECT * so we also get AppSheet selector fields (storage/status)
+        row = fetch_one("SELECT * FROM vessel_excel WHERE excel_id=%s", (excel_id,))
         if row:
             return row
         if time.time() >= deadline:
@@ -375,9 +437,6 @@ def get_vessel_storages(vessel_id: str) -> List[Dict[str, Any]]:
 
 
 def get_export_rows(excel_id: str) -> List[Dict[str, Any]]:
-    """
-    Includes item_status + item_type + classification info.
-    """
     sql = """
         SELECT
           v.vessel_item_id,
@@ -497,7 +556,6 @@ def fill_vessel_information_sheet(
     if not purchasing:
         purchasing = vget("vessel_contact_email", "email")
 
-    # Use enriched names directly (already verified in DB)
     flag_name = vget("vessel_flag_name", default="") or vget("vessel_flag", default="")
     cat_name = vget("vessel_category_name", default="") or vget("vessel_category", default="")
 
@@ -553,7 +611,6 @@ def fill_vessel_information_sheet(
     safe_set(ws, "C12", txt(cat_name))
     safe_set(ws, "E12", oxygen)
 
-    # certificates list: K/L rows 4-12
     today = date.today()
     for r in range(4, 13):
         ws[f"K{r}"].value = None
@@ -596,15 +653,11 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[st
     c_cert = col_required("Certificate qty")
     c_exp = col_required("Expiry date")
     c_law = col_required("Law code")
-
-    # NEW column (you added in template 2.06)
     c_status = col_required("Status")
-
     c_pack = col_required("Pack name")
 
     c_class = {k: col_optional(k) for k in CLASS_LETTERS}
 
-    # clear old rows
     for r in range(2, MAX_ROWS + 2):
         for cidx in (c_storage, c_article, c_item, c_qty, c_total, c_cert, c_exp, c_law, c_status, c_pack):
             ws.cell(r, cidx).value = None
@@ -647,10 +700,7 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[st
             ws.cell(r, c_exp).value = None
 
         ws.cell(r, c_law).value = rr.get("vessel_item_law_code") or ""
-
-        # NEW: item_status into Status column
         ws.cell(r, c_status).value = rr.get("item_status") or ""
-
         ws.cell(r, c_pack).value = rr.get("pack_name") or ""
 
         flags: Set[str] = set()
@@ -793,7 +843,10 @@ def download_file(excel_id: str, token: str):
     vessel = try_get_vessel_json(vessel_id)
 
     rows = get_export_rows(excel_id)
-    rows = [r for r in (rows or []) if (num(r.get("vessel_item_quantity")) or 0) > 0]
+
+    # Apply AppSheet filters (leave empty -> export all), always excludes qty <= 0
+    status_filter, storage_filter = get_filters_from_excel_row(excel_row)
+    rows = apply_export_filters(rows, status_filter, storage_filter)
 
     certs = get_latest_certificates_by_pack(vessel_id)
     storages = get_vessel_storages(vessel_id)
@@ -825,7 +878,10 @@ def email(excel_id: str, token: str, to_email: str):
     vessel = try_get_vessel_json(vessel_id)
 
     rows = get_export_rows(excel_id)
-    rows = [r for r in (rows or []) if (num(r.get("vessel_item_quantity")) or 0) > 0]
+
+    # Apply AppSheet filters (leave empty -> export all), always excludes qty <= 0
+    status_filter, storage_filter = get_filters_from_excel_row(excel_row)
+    rows = apply_export_filters(rows, status_filter, storage_filter)
 
     certs = get_latest_certificates_by_pack(vessel_id)
     storages = get_vessel_storages(vessel_id)
