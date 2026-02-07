@@ -855,18 +855,18 @@ def fill_inventory_sheet(ws, rows: List[Dict[str, Any]], storages_by_id: Dict[st
         flags = parse_item_classification(rr.get("item_classification_export"))
         # Vessel-level fallback for N/M/C/D/F/O (matches the sheet meaning)
         v = vessel or {}
-        if v.get("narcotics") is True:
-            flags.add("N")
-        if v.get("malaria_area") is True:
-            flags.add("M")
-        if v.get("cool_goods") is True:
-            flags.add("C")
-        if v.get("dangerous_good") is True:
-            flags.add("D")
-        if v.get("female_onboard") is True:
-            flags.add("F")
-        if v.get("medical_oxygen") is True:
-            flags.add("O")
+if to_bool(v.get("narcotics")) is True:
+    flags.add("N")
+if to_bool(v.get("malaria_area")) is True:
+    flags.add("M")
+if to_bool(v.get("cool_goods")) is True:
+    flags.add("C")
+if to_bool(v.get("dangerous_good")) is True:
+    flags.add("D")
+if to_bool(v.get("female_onboard")) is True:
+    flags.add("F")
+if to_bool(v.get("medical_oxygen")) is True:
+    flags.add("O")
 
         for letter in CLASS_LETTERS:
             cidx = c_class.get(letter)
