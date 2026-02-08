@@ -225,18 +225,38 @@ def letters_from_item_type(item_type: Any) -> Set[str]:
 # ==============================
 
 def parse_enumlist(v: Any) -> List[str]:
+    """
+    AppSheet EnumList often arrives as:
+      - "id1,id2"
+      - "id1;id2"
+      - list/tuple already
+      - sometimes JSON-like string '["id1","id2"]'
+    """
     if v is None:
         return []
     if isinstance(v, (list, tuple, set)):
         return [str(x).strip() for x in v if str(x).strip()]
+
     s = str(v).strip()
     if not s:
         return []
-    return [x.strip() for x in s.split(",") if x.strip()]
+
+    # try json list
+    if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, list):
+                return [str(x).strip() for x in obj if str(x).strip()]
+        except Exception:
+            pass
+
+    # split by comma or semicolon
+    parts = [x.strip() for x in re.split(r"[;,]", s) if x.strip()]
+    return parts
 
 
 def get_filters_from_excel_row(excel_row: Dict[str, Any]) -> Tuple[str, List[str]]:
-    # Status is Enum (Active/Scrap). Column name in vessel_excel is usually item_status.
+    # Status is Enum (Active/Scrap). In your vessel_excel it's item_status
     status = str(
         (excel_row or {}).get("item_status")
         or (excel_row or {}).get("status")
@@ -244,9 +264,10 @@ def get_filters_from_excel_row(excel_row: Dict[str, Any]) -> Tuple[str, List[str
         or ""
     ).strip()
 
-    # Storage selector is EnumList in AppSheet. Column name can differ; try common ones.
+    # Storage selector is EnumList of storage_id (your column is storage_id)
     storage_raw = (
-        (excel_row or {}).get("storage")
+        (excel_row or {}).get("storage_id")     # <-- IMPORTANT FIX
+        or (excel_row or {}).get("storage")
         or (excel_row or {}).get("storages")
         or (excel_row or {}).get("storage_filter")
         or (excel_row or {}).get("storage_display_filter")
@@ -259,7 +280,7 @@ def get_filters_from_excel_row(excel_row: Dict[str, Any]) -> Tuple[str, List[str
 
 def apply_export_filters(rows: List[Dict[str, Any]], status: str, storages: List[str]) -> List[Dict[str, Any]]:
     status_l = status.strip().lower()
-    stor_l = [s.strip().lower() for s in (storages or []) if s.strip()]
+    stor_set = set(s.strip().lower() for s in (storages or []) if str(s).strip())
 
     out = []
     for r in rows or []:
@@ -274,10 +295,11 @@ def apply_export_filters(rows: List[Dict[str, Any]], status: str, storages: List
                 continue
 
         # Storage filter (AND)
-        if stor_l:
-            sd = str(r.get("storage_display") or "").strip().lower()
+        if stor_set:
             sid = str(r.get("storage_id") or "").strip().lower()
-            if not any(sd == x or sid == x for x in stor_l):
+            sd = str(r.get("storage_display") or "").strip().lower()
+            # primary match on id; allow display fallback just in case
+            if sid not in stor_set and sd not in stor_set:
                 continue
 
         out.append(r)
@@ -292,7 +314,7 @@ def apply_export_filters(rows: List[Dict[str, Any]], status: str, storages: List
 def get_excel_row_retry(excel_id: str, max_wait_s: float = 6.0, step_s: float = 0.25) -> Optional[Dict[str, Any]]:
     deadline = time.time() + max_wait_s
     while True:
-        # SELECT * so we also get AppSheet selector fields (storage/status)
+        # SELECT * so we also get AppSheet selector fields (storage_id/item_status)
         row = fetch_one("SELECT * FROM vessel_excel WHERE excel_id=%s", (excel_id,))
         if row:
             return row
@@ -917,6 +939,28 @@ def email(excel_id: str, token: str, to_email: str):
             s.send_message(msg)
 
     return {"ok": True, "sent_to": to_email}
+
+
+@app.get("/debug_excel")
+def debug_excel(excel_id: str, token: str):
+    """
+    Debug endpoint to verify Cloud Run reads selectors from vessel_excel.
+    """
+    excel_row = get_excel_row_retry(excel_id, max_wait_s=6.0, step_s=0.25)
+    if not excel_row:
+        raise HTTPException(status_code=404, detail="excel_id not found")
+
+    validate_token(excel_row, token)
+
+    status_filter, storage_filter = get_filters_from_excel_row(excel_row)
+
+    return {
+        "excel_id": excel_row.get("excel_id"),
+        "raw_storage_id": excel_row.get("storage_id"),
+        "raw_item_status": excel_row.get("item_status"),
+        "parsed_status": status_filter,
+        "parsed_storages": storage_filter,
+    }
 
 
 @app.get("/")
